@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 运行时产物
+profile/
+profile/**
+.tmp/
+.tmp/**
+workspace/
+.bridge_settings.json
+logs/
+*.log
+
+# 编辑器
+.idea/
+.vscode/

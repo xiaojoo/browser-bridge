@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Web LLM Bridge</title>
+<link rel="stylesheet" href="css/app.css" />
+</head>
+<body>
+<div class="app">
+
+  <!-- 左侧栏 -->
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="logo" aria-hidden="true">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M3 15c2-6 4-6 6 0s4 6 6 0 4-6 6 0"/><path d="M3 9c2-5 4-5 6 0s4 5 6 0 4-5 6 0"/>
+        </svg>
+      </span>
+      <span class="name">Web LLM Bridge</span>
+    </div>
+    <button class="new" id="btnNew" title="本地新对话: 只在本地开一段新会话, 远端聊的还是同一个会话">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+      <span>开启新对话</span>
+    </button>
+    <div class="divider"></div>
+    <div class="section sec-head">
+      <span>会话</span>
+      <button class="ws-icon" id="convRefresh" title="刷新会话列表">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v5h-5"/></svg>
+      </button>
+    </div>
+    <div class="history" id="convList"></div>
+    <!-- 工作区: 仅 World 模式显示(切换见 setModeLabel) -->
+    <div class="ws-block" id="wsBlock" hidden>
+    <div class="divider"></div>
+    <div class="ws-head">
+      <span class="ws-title" id="wsTitle">📁 workspace</span>
+      <div class="ws-actions">
+        <button class="ws-icon" id="wsCollapse" title="全部折叠">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H5a2 2 0 0 0-2 2v4M15 3h4a2 2 0 0 1 2 2v4M9 21H5a2 2 0 0 1-2-2v-4M15 21h4a2 2 0 0 0 2-2v-4"/><path d="M4 12h16"/></svg>
+        </button>
+        <button class="ws-icon" id="wsExpand" title="全部展开">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 3H5a2 2 0 0 0-2 2v4M15 3h4a2 2 0 0 1 2 2v4M9 21H5a2 2 0 0 1-2-2v-4M15 21h4a2 2 0 0 0 2-2v-4"/><path d="M12 8v8M8 12h8"/></svg>
+        </button>
+        <button class="ws-icon" id="wsNew" title="新建文件">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5M12 12v6M9 15h6"/></svg>
+        </button>
+        <button class="ws-icon" id="wsRefresh" title="刷新">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v5h-5"/></svg>
+        </button>
+      </div>
+    </div>
+    <div class="ws-tree" id="wsTree"></div>
+    <div class="ws-foot">
+      <span class="ws-sel" id="wsSelCount"></span>
+    </div>
+    </div>
+    <div class="profile">
+      <div class="avatar" id="pAvatar">AI</div>
+      <button class="p-pick" id="btnProvider" title="选择要连接的站点" aria-haspopup="listbox" aria-expanded="false">
+        <span class="p-pick-name" id="chipName">未连接</span>
+      </button>
+      <select class="provider" id="selProvider" hidden tabindex="-1" aria-hidden="true"></select>
+      <div class="picker" id="providerPicker" role="listbox" aria-label="选择要连接的站点"></div>
+    </div>
+    <button class="btnStart" id="btnStart">① 启动并登录</button>
+  </aside>
+
+  <!-- 主区 -->
+  <main class="main">
+    <header class="top">
+      <div class="top-left">
+        <span class="icon" id="btnSidebar" title="收起/展开侧栏" aria-hidden="true">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M9 4v16"/></svg>
+        </span>
+        <span class="icon" title="搜索" aria-hidden="true">
+          <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>
+        </span>
+        <div class="top-title-wrap">
+          <div class="title" id="chatTitle">默认会话</div>
+          <div class="mode" id="chatMode">网页桥接</div>
+        </div>
+      </div>
+      <div class="top-right">
+        <span class="state-chip"><span class="dot" id="chipDot2"></span><b id="chipState">未启动</b></span>
+        <span class="icon refresh" title="重新加载" aria-hidden="true">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v5h-5"/></svg>
+        </span>
+      </div>
+    </header>
+
+    <div class="content-wrap" id="convWrap">
+      <section class="content" id="conv"></section>
+    </div>
+    <!-- 自己画的滚动条: 轨道从页头下面一直到底, 滑块可拖 -->
+    <div class="cscroll" id="cScroll"><div class="cscroll-thumb" id="cScrollThumb"></div></div>
+
+    <!-- 消息列表右侧的"输入导航": 一行 = 一条你发过的输入, 行尾一条小横线;
+         当前看到的那条是蓝色(文字 + 横线都高亮), 跟着正文滚动走。平时收成等间距小短线, 鼠标落在卡片上才展开。 -->
+    <div class="convnav" id="convNav" hidden>
+      <div class="cnav-card" id="convNavCard">
+        <div class="cnav-list" id="convNavList"></div>
+      </div>
+    </div>
+    <!-- 悬停某一行时浮在卡片左边的提示气泡(显示这条输入的完整文字; 超出高度截断, 内部不滚) -->
+    <div class="cnav-tip" id="convNavTip" hidden></div>
+
+    <div class="welcome" id="welcome">
+      <div class="w-hero">
+        <div class="w-logo" aria-hidden="true">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 15c2-6 4-6 6 0s4 6 6 0 4-6 6 0"/><path d="M3 9c2-5 4-5 6 0s4 5 6 0 4-5 6 0"/></svg>
+        </div>
+        <h2 class="w-title">使用 <span id="welcomeModeLabel">Chat 模式</span> 开始对话</h2>
+        <div class="w-modes">
+          <button class="seg active" id="modeChat">Chat 模式</button>
+          <button class="seg" id="modeWorld">World 模式</button>
+        </div>
+        <div class="w-sub" id="welcomeSub"></div>
+        <div class="w-slot" id="composerSlot"></div>
+      </div>
+    </div>
+
+    <div class="composer-wrap">
+      <div class="composer">
+        <div id="chips" class="chips"></div>
+        <textarea class="input" id="input" rows="1" spellcheck="false"
+          placeholder="给 AI 发送消息…（Enter 发送 / Shift+Enter 换行, 可直接 Ctrl+V 粘贴）"></textarea>
+        <div class="bottom">
+          <button class="attach-btn" id="btnAttach" title="上传文件 / 图片">
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.5l-8.6 8.6a6 6 0 0 1-8.5-8.5l9.2-9.2a4 4 0 0 1 5.7 5.7l-9.2 9.2a2 2 0 0 1-2.8-2.8l8.4-8.4"/></svg>
+            <span>附件</span>
+          </button>
+          <input type="file" id="fileInput" multiple hidden accept="image/*,.pdf,.txt,.md,.py,.js,.json,.csv,.doc,.docx,.xls,.xlsx,.ppt,.pptx,.zip" />
+          <button class="tool primary" id="btnNew2" title="在站点新建会话: ChatGPT/DeepSeek 页面也会开新会话, 本地跟着换新 id">
+            <span class="t-icon"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></span>
+            <span>新对话</span>
+          </button>
+          <div class="replypick" id="replyPick">
+            <button class="tool replybtn" id="btnReply" aria-haspopup="listbox" aria-expanded="false"
+              title="这条消息交给谁回答: 网页模型(走桥接浏览器) 或 只用本地模型(不进 ChatGPT)">
+              <span class="rb-av" id="rbAv">AI</span>
+              <span class="rb-nm" id="rbNm">网页模型</span>
+              <span class="rb-caret">▾</span>
+            </button>
+            <div class="picker replypicker" id="replyPicker" role="listbox" aria-label="这条消息交给谁回答"></div>
+          </div>
+          <span class="spacer"></span>
+          <button class="send" id="btnSend" title="发送" aria-label="发送">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+          </button>
+        </div>
+      </div>
+      <div class="tip">内容由 AI 生成，请仔细甄别 · 本地桥接 · 仅 127.0.0.1</div>
+    </div>
+  </main>
+
+</div>
+<div id="toast"></div>
+<div class="rowmenu" id="rowMenu" role="menu"></div>
+
+<!-- 设置(planner) -->
+<div class="overlay" id="setOverlay">
+  <div class="dialog planner-dialog">
+    <h4>设置 — 规划/摘要模型(planner)</h4>
+    <div class="dlg-body">
+      <div class="hint2" id="setNote">这里的设置是<b>全局</b>的: 所有会话/窗口共用同一份(存在 .bridge_settings.json),
+        换会话、换窗口都不会失效。World 模式的落盘/自测需要一个能读懂代码的模型, 选「本地模型」或「API」;
+        选「网页当前 Provider」时只能做规划/摘要, 不能落盘。World 模式的规划模型拆步骤 + 挑出每步真正需要的文件
+        (只把这些文件发给网页模型), 代码交给网页模型(ChatGPT/DeepSeek 页面)写。</div>
+      <div class="set-row">
+        <label>规划模型类型</label>
+        <select id="setType">
+          <option value="web">网页当前 Provider(免 Key; 只能规划/摘要, 不能落盘)</option>
+          <option value="api">OpenAI 兼容官方 API(DeepSeek/OpenAI 等; 可落盘, 要 Key)</option>
+          <option value="local">本地模型(LM Studio / llama.cpp 等; 不用 Key, 可落盘)</option>
+        </select>
+        <button type="button" id="setDetect">🔍 检测本地模型(LM Studio / llama.cpp / vLLM / Ollama)</button>
+      </div>
+      <div class="set-row api-only"><label>API Base URL</label>
+        <input id="setBase" placeholder="https://api.deepseek.com/v1" spellcheck="false" /></div>
+      <div class="set-row api-only"><label>模型名</label>
+        <input id="setModel" placeholder="deepseek-chat" spellcheck="false" /></div>
+      <div class="set-row api-only key-only"><label>API Key(留空 = 保持不变)</label>
+        <input id="setKey" type="password" placeholder="sk-..." spellcheck="false" />
+        <span class="hint2" id="setKeyHint"></span></div>
+      <div class="set-row"><label>工程任务 · 远程仓库地址(可选, 会写进给网页模型的提示词, 让它自己拉取代码)</label>
+        <input id="setRepo" placeholder="https://github.com/you/repo" spellcheck="false" /></div>
+      <div class="set-row"><label>工程任务 · 自测命令(在工作区目录下执行, 留空则不自动自测)</label>
+        <input id="setTestCmd" placeholder="例如 pytest -q / cmake --build build / npm test" spellcheck="false" /></div>
+      <label class="eng-summary-label"><input type="checkbox" id="setConfirm" checked class="accent-check" />
+        本地模型落盘前弹确认框(可逐条勾选要写入的文件)</label>
+      <div class="set-row api-only"><label>温度</label>
+        <input id="setTemp" type="number" step="0.1" min="0" max="2" value="0.2" /></div>
+      <div id="setResult" class="hint2"></div>
+    </div>
+    <div class="dlg-foot">
+      <button id="setClose">关闭</button>
+      <button id="setClearKey" class="api-only">清除 Key</button>
+      <button id="setTest">测试连接</button>
+      <button class="pri" id="setSave">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 保存路径对话框 -->
+<div class="overlay" id="dlgOverlay">
+  <div class="dialog path-dialog">
+    <h4 id="dlgTitle">输入路径</h4>
+    <div class="dlg-body">
+      <input id="dlgInput" placeholder="相对 workspace/ 的路径, 如 src/main.py" spellcheck="false" />
+    </div>
+    <div class="dlg-foot">
+      <button id="dlgCancel">取消</button>
+      <button class="pri" id="dlgOk">确定</button>
+    </div>
+  </div>
+</div>
+
+<!-- 本地模型落盘确认框(可逐条勾选) -->
+<div class="overlay" id="applyOverlay">
+  <div class="dialog apply-dialog">
+    <h4>本地模型准备执行的步骤 — 勾选后才会进行</h4>
+    <div class="dlg-body">
+      <div class="hint2" id="applyNote"></div>
+      <div class="apply-list" id="applyList"></div>
+    </div>
+    <div class="dlg-foot">
+      <button id="applySkip">取消(直接结束)</button>
+      <button class="pri" id="applyOk">执行勾选的步骤</button>
+    </div>
+  </div>
+</div>
+
+<!-- 工作区目录(可指向任意本地文件夹) -->
+<div class="overlay" id="wsOverlay">
+  <div class="dialog ws-dialog">
+    <h4>工作区目录</h4>
+    <div class="dlg-body">
+      <div class="set-row">
+        <label>目录(绝对路径, 也可在下面点进文件夹选择)</label>
+        <input id="wsRootInput" spellcheck="false" placeholder="例如 H:\projects\my-app" />
+      </div>
+      <div class="ws-browse">
+        <div class="ws-browse-head">
+          <button id="wsUp" title="上一级">↑</button>
+          <span id="wsBrowsePath"></span>
+        </div>
+        <div class="ws-browse-list" id="wsBrowseList"></div>
+      </div>
+      <div class="hint2" id="wsConvHint"></div>
+      <div class="hint2">只影响本地工作区面板与工程任务(World 模式)的读写范围:
+        代码块的「保存」、左栏文件树、勾选上下文都基于这个目录。</div>
+    </div>
+    <div class="dlg-foot">
+      <button id="wsDefault">恢复默认</button>
+      <button id="wsCancel">取消</button>
+      <button class="pri" id="wsApply">使用此目录</button>
+    </div>
+  </div>
+</div>
+
+<!-- 文件编辑器 -->
+<div class="overlay" id="editOverlay">
+  <div class="dialog">
+    <h4>编辑: <span class="editor-path" id="editPath"></span></h4>
+    <div class="dlg-body">
+      <div class="hint2">给 LLM 发送消息。</div>
+      <textarea id="editText" spellcheck="false"></textarea>
+    </div>
+    <div class="dlg-foot">
+      <button id="editClose">关闭</button>
+      <button id="editSend">发送给 AI</button>
+      <button class="pri" id="editSave">保存</button>
+    </div>
+  </div>
+</div>
+
+
+<script src="js/app.js"></script>
+</body>
+</html>
+
