@@ -24,7 +24,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import capture, config, engineer, events, planner, providers, settings, workspace
+from . import (capture, config, engineer, events, file_operator, planner, providers,
+               settings, workspace)
 from .browser import BrowserManager
 
 log = logging.getLogger("bridge")
@@ -33,6 +34,9 @@ manager = BrowserManager()
 _clients: set[WebSocket] = set()
 _tasks: set[asyncio.Task] = set()
 _staged_files: dict[str, dict] = {}   # id -> {name, mime, data}
+_recent_msgs: list[dict] = []         # 最近几轮对话(桥发出去的), 换窗口接力时的兜底上下文
+_RECENT_MAX = 40
+_last_extract: list[dict] = []        # 最近一次"整理出来的文件改动"(卡片上那个"写入工作区"按钮用)
 
 
 def _stage_file(data: bytes, name: str, mime: str) -> str:
@@ -149,14 +153,21 @@ async def _run_turn(text: str, files: list[dict] | None = None):
     async def on_delta(kind, chunk, snapshot):
         nonlocal counters
         counters["deltas"] += 1
+        if kind == "text":                       # 攒一份完整回答: 换窗口接力时当兜底上下文
+            if snapshot:
+                answer["text"] = chunk or ""
+            else:
+                answer["text"] = (answer.get("text") or "") + (chunk or "")
         if counters["deltas"] == 1:
-            log.info("turn[%s] first delta kind=%s snap=%s", mid[:8], kind, snapshot)
+            preview = "".join((chunk or "").split())[:40]
+            log.info("turn[%s] first delta kind=%s snap=%s text=%r", mid[:8], kind, snapshot, preview)
         await broadcast(events.delta(mid, conv, kind, chunk, snapshot))
 
     async def on_warn(msg):
         await broadcast(events.info_event("捕获警告: " + msg))
 
     counters = {"deltas": 0}
+    answer: dict = {"text": ""}
 
     conv = None
     truncated = False
@@ -166,8 +177,20 @@ async def _run_turn(text: str, files: list[dict] | None = None):
     try:
         if stream_mode_on:
             await capture.enable_capture(page)
+        # 发送前先记下页面上"当前这条回答"= 上一轮的结果。发送会让站点重绘整段对话,
+        # 之后再读可能读到空, 那样上一轮的回答就会被当成本轮的答案回传(页面出现两份同样的回答)。
+        baseline = None
+        try:
+            baseline = await capture.read_snapshot(page, manager.provider.snapshot_selector)
+        except Exception:  # noqa: BLE001
+            baseline = None
+        log.info("turn[%s] baseline(发送前的最后一条回答): %d 字 id=%s text=%r", mid[:8],
+                 len("".join(((baseline or {}).get("text") or "").split())),
+                 (baseline or {}).get("id") or "",
+                 "".join(((baseline or {}).get("text") or "").split())[:40])
         if files:
             ok, errs = await manager.attach_files(files)
+            log.info("attach: ok=%d/%d errs=%s", ok, len(files), errs[:2])
             if ok:
                 await broadcast(events.info_event(f"已附加 {ok} 个文件"))
             if errs:
@@ -200,9 +223,15 @@ async def _run_turn(text: str, files: list[dict] | None = None):
         try:
             truncated, errors = await capture.wait_turn_end(
                 page, on_delta, on_warn=on_warn, mode=mode,
-                snapshot_selector=manager.provider.snapshot_selector)
+                snapshot_selector=manager.provider.snapshot_selector,
+                baseline=baseline)
             log.info("turn[%s] wait_turn_end done truncated=%s errs=%s deltas=%d",
                      mid[:8], truncated, errors, counters["deltas"])
+            _ans = "".join((answer.get("text") or "").split())
+            _base = "".join(((baseline or {}).get("text") or "").split())
+            if _ans and _base and _ans == _base:
+                log.warning("turn[%s] 本轮答案与发送前那条逐字相同 —— 可能是把上一轮当成本轮了",
+                            mid[:8])
         except capture.NoDataError as exc:
             log.warning("turn[%s] NoData: %s", mid[:8], exc)
             await broadcast(events.error_event(mid, conv, str(exc)))
@@ -210,6 +239,26 @@ async def _run_turn(text: str, files: list[dict] | None = None):
         finally:
             if stream_mode_on:
                 await capture.disable_capture(page)
+
+        # 【兜底校正】dom 模式下"生成结束"可能判早了(最后一段还没渲染出来就被判静默结束),
+        # 也可能把**上一条回答**当成了本轮答案。拿站点那份整段对话对一下, 该换就换。
+        # (不滚动窗口, 只要最后那条; 失败也不影响本轮)
+        if mode == "dom" and (answer.get("text") or "").strip():
+            try:
+                site = await manager.read_conversation(deep=False)
+                last_a = ""
+                for m in reversed(site.get("messages") or []):
+                    if m.get("role") == "assistant":
+                        last_a = (m.get("text") or "").strip()
+                        break
+                better = _better_answer(answer.get("text") or "", last_a)
+                if better:
+                    log.info("turn[%s] 采集到 %d 字, 站点那条 %d 字 -> 以站点为准纠正",
+                             mid[:8], len((answer.get("text") or "").strip()), len(better))
+                    answer["text"] = better
+                    await broadcast(events.delta(mid, conv, "text", better, True))
+            except Exception:  # noqa: BLE001
+                log.debug("turn[%s] 站点整段对话校正跳过", mid[:8], exc_info=True)
 
         # 站点有时不会在发送后清空输入框: 内容还留着就清掉(否则它会变成草稿, 下次又冒出来)
         await _cleanup_composer_after_turn(manager, text, mid)
@@ -220,6 +269,108 @@ async def _run_turn(text: str, files: list[dict] | None = None):
     if errors:
         await broadcast(events.info_event("本轮流中有警告: " + "; ".join(errors[:3])))
     await broadcast(events.message_end(mid, conv, truncated=truncated))
+    _remember_turn(text, answer.get("text") or "")
+
+
+def _remember_turn(user_text: str, answer_text: str):
+    """记下最近几轮(桥发出去的), 站点读不回对话时(如 DeepSeek)拿它当接力上下文。"""
+    if (user_text or "").strip():
+        _recent_msgs.append({"role": "user", "text": user_text})
+    if (answer_text or "").strip():
+        _recent_msgs.append({"role": "assistant", "text": answer_text})
+    del _recent_msgs[:max(0, len(_recent_msgs) - _RECENT_MAX)]
+
+
+# ---------- 站点上下文到上限 -> 自动换窗口时的"上下文接力" ----------
+# 新窗口是空白的: 直接把原话重发, 网页模型就"失忆"了。所以换窗口之前先把上一段对话
+# 汇总成一份接力上下文(本地/规划模型只做**汇总**, 不写代码), 拼在新消息前面一起发过去。
+_HANDOFF_PROMPT = (
+    "下面是一段对话(用户和网页版 AI 在聊一个具体任务)。它的上下文已经到上限, 要换一个新窗口接着聊, "
+    "新窗口里对方**什么都不记得**。请把这段对话汇总成一份可以直接放进新窗口开场的上下文。\n"
+    "要求:\n"
+    "1. 简体中文; 小标题 + 要点, 不要寒暄、不要复述原话、不要评价这段对话;\n"
+    "2. 必须留住: 用户的目标、已经确认的结论/事实、当前进度、待办与下一步, 以及之后会用到的"
+    "具体细节(文件路径、命令、参数、版本号、报错原文里的关键片段);\n"
+    "3. 总长不超过 1200 字; 直接输出这份上下文本身。")
+
+
+def _conversation_digest(msgs: list[dict], limit: int = 60000) -> str:
+    """把对话拼成"【用户】…/【助手】…"; 太长就留头 + 尾(中间省略)。"""
+    parts: list[str] = []
+    for m in msgs or []:
+        t = str(m.get("text") or "").strip()
+        if not t:
+            continue
+        role = "用户" if str(m.get("role")) == "user" else "助手"
+        parts.append("【" + role + "】" + t[:4000])
+    text = "\n\n".join(parts)
+    if len(text) <= limit:
+        return text
+    head = text[: limit // 6]
+    tail = text[-(limit - limit // 6):]
+    return (head + "\n\n……(中间省略 " + str(len(text) - limit) + " 字)……\n\n" + tail)
+
+
+async def _handoff_context(manager) -> str:
+    """换新窗口之前: 把当前这段对话汇总成"接力上下文"(没有可汇总的就返回空串)。"""
+    msgs: list[dict] = []
+    try:
+        site = await manager.read_conversation()
+        if site.get("ok"):
+            msgs = site.get("messages") or []
+    except Exception as exc:  # noqa: BLE001
+        log.warning("读站点对话失败(改用本地记录): %s", exc)
+    if not msgs:
+        msgs = list(_recent_msgs)          # 站点读不回来(DeepSeek 之类)-> 用桥自己发过的
+    if not msgs:
+        await broadcast(events.info_event("要换新窗口了, 但没读到上一段对话, 这次不带上下文"))
+        return ""
+    pcfg = settings.load().get("planner", {})
+    if not planner_ready(pcfg):
+        await broadcast(events.info_event(
+            "站点上下文到上限, 已换新窗口; 但没配「规划模型」, 没法把上一段汇总带过去"
+            "(设置里选本地模型或填 API Key 就能自动接力)"))
+        return ""
+    digest = _conversation_digest(msgs)
+    try:
+        out = (await planner.ask(pcfg, _HANDOFF_PROMPT + "\n\n【对话】\n" + digest) or "").strip()
+    except planner.PlannerError as exc:
+        log.warning("汇总上下文失败: %s", exc)
+        await broadcast(events.info_event("汇总上一段上下文失败: " + str(exc)[:120]))
+        return ""
+    if not out:
+        return ""
+    log.info("上下文接力: 读到 %d 条消息, 汇总成 %d 字", len(msgs), len(out))
+    return ("【上一个窗口的上下文(本地模型汇总: 网页那边上下文到上限, 已换新窗口)】\n"
+            + out[:6000] + "\n【以上是之前聊的内容, 请接着继续】")
+
+
+manager.on_context_limit = _handoff_context
+
+
+
+def _better_answer(captured: str, site_last: str) -> str:
+    """站点那条助手消息是不是更该用? 返回要用的话(否则空串)。
+
+    三种要纠的情况 + 两种不动:
+      * 站点是本地那份的**延续**(前缀关系) -> 生成还没结束就被判定收工, 用站点的补全;
+      * 开头就对不上 -> 采集把**上一条回答**当成本轮答案了(错位/滞后一条), 用站点的;
+      * 本地为空 -> 用站点的;
+      * 一样长/一样内容, 或站点更短且是本地的前缀 -> 不动(免得把采集结果换成格式略有差异的版本)。
+    """
+    got = (captured or "").strip()
+    site = (site_last or "").strip()
+    if not site:
+        return ""
+    if not got:
+        return site
+    if got == site:
+        return ""
+    if site.startswith(got):
+        return site
+    if got.startswith(site):
+        return ""
+    return site
 
 
 async def _cleanup_composer_after_turn(manager, text: str, mid: str):
@@ -289,6 +440,9 @@ class WorldApplyRequest(BaseModel):
     task: str = Field(default="", max_length=200_000)
     text: str = Field(default="", max_length=400_000)
     include: list[str] = Field(default_factory=list)
+    # "接着上一条"写的回答: 前面那几条回答的原文(最多 4 条, 早的在前) —— 一起整理, 卡片才列得全。
+    # 同路径时**本条的版本覆盖前面的**(后面的 _dedupe_items 就是留最后一次出现的)。
+    extra_texts: list[str] = Field(default_factory=list)
     dry_run: bool = False          # True = 只让本地模型给方案, 不写盘(给确认框看)
 
 
@@ -304,6 +458,7 @@ class WorldVerifyRequest(BaseModel):
     command: str = Field(default="", max_length=2000)   # 首选命令(可留空, 由本地模型挑)
     max_rounds: int = 4
     timeout: float = 300
+    force: bool = False        # 用户明确选了「这次不改文件, 只让它去项目里自测」时置 true
 
 
 class WorldTestRequest(BaseModel):
@@ -315,6 +470,12 @@ class LocalChatRequest(BaseModel):
     """只用本地模型回一条(不经过网页模型): 正文 + 最近几轮上下文。"""
     text: str = Field(min_length=1, max_length=400_000)
     history: list[dict] = Field(default_factory=list)
+
+
+class FileOperateRequest(BaseModel):
+    """ChatGPT -> bridge 的纯文件操作: 只有这两个 action, 不带任何规划参数。"""
+    action: str = Field(min_length=1, max_length=32)
+    path: str = Field(min_length=1, max_length=4096)
 
 
 def planner_ready(pcfg: dict) -> bool:
@@ -359,10 +520,15 @@ async def api_workspace_info():
 
 @app.post("/api/workspace/root")
 async def api_workspace_root(req: WorkspaceRootRequest):
+    """切工作区根目录。**只有用户主动动作**(点会话/选目录)才该调到这里 ——
+    留一行日志, 方便发现"自己变了"的情况是哪个动作引起的。"""
+    before = str(workspace.ROOT)
     try:
         info = workspace.set_root(req.path)
     except workspace.WorkspaceError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
+    if info["root"] != before:
+        log.info("workspace root: %s -> %s", before, info["root"])
     return {"ok": True, **info}
 
 
@@ -454,6 +620,81 @@ async def api_engineer(req: EngineerRequest):
     return {"ok": True, "state": "queued"}
 
 
+# ---------- ChatGPT -> 本地纯文件执行器 (不经过任何本地模型) ----------
+_ALLOWED_FILE_ACTIONS = frozenset({"read_file", "send_file"})
+
+
+@app.post("/api/file/operate")
+async def api_file_operate(req: FileOperateRequest):
+    """执行 ChatGPT 指定的本地文件操作: read_file / send_file。
+
+    这里绝对不调用 planner.ask() / 本地模型 / engineer:
+    action 和 path 都由 ChatGPT 决定, bridge 只执行。
+    """
+    action = (req.action or "").strip().lower()
+    path = (req.path or "").strip()
+
+    if action not in _ALLOWED_FILE_ACTIONS:
+        return JSONResponse({"ok": False, "error": f"不支持的文件操作: {action}",
+                             "allowed_actions": sorted(_ALLOWED_FILE_ACTIONS)},
+                            status_code=400)
+    if not path:
+        return JSONResponse({"ok": False, "error": "path 不能为空"}, status_code=400)
+
+    try:
+        if action == "read_file":
+            result = file_operator.read_file(path)
+            log.info("file operation: read_file path=%s", result.get("path"))
+            return {"ok": True, "action": "read_file", "result": result}
+
+        if action == "send_file":
+            if manager.busy:      # 正在生成/发送时不要再动站点的输入框/附件区
+                return JSONResponse({"ok": False, "action": "send_file",
+                                     "error": "浏览器正在处理其他任务, 请稍候"},
+                                    status_code=409)
+            manager.busy = True
+            await broadcast(events.status_event(**manager.status()))
+            try:
+                result = await file_operator.send_file(manager, path)
+            finally:
+                manager.busy = False
+                await broadcast(events.status_event(**manager.status()))
+            log.info("file operation: send_file path=%s size=%s",
+                     result.get("path"), result.get("size"))
+            return {"ok": True, "action": "send_file", "result": result}
+
+    except file_operator.UploadBlockedError as exc:
+        # 站点侧不让传文件: 除了给调用方 400, 也**弹到页面上** ——
+        # 否则用户只会看到"已附加/正在发送", 完全不知道文件被站点拦了。
+        log.warning("站点不让传文件: %s", exc)
+        await broadcast(events.info_event(str(exc)))
+        return JSONResponse({"ok": False, "action": action, "path": path,
+                             "error": str(exc), "upload_blocked": True}, status_code=400)
+
+    except file_operator.FileOperatorError as exc:
+        log.warning("file operation failed: action=%s path=%s error=%s", action, path, exc)
+        return JSONResponse({"ok": False, "action": action, "path": path, "error": str(exc)},
+                            status_code=400)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("file operation crashed: action=%s path=%s", action, path)
+        return JSONResponse({"ok": False, "action": action, "path": path,
+                             "error": f"文件操作异常: {exc}"}, status_code=500)
+
+    return JSONResponse({"ok": False, "action": action, "path": path,
+                         "error": "未处理的文件操作"}, status_code=500)
+
+
+@app.get("/api/file/attach_diag")
+async def api_attach_diag(name: str = ""):
+    """上传诊断(只读, 不碰站点): 这些文件名进站点附件区了吗? 页面上有哪些相关提示?
+
+    name 用逗号分隔可查多个。排障用: "文件到底传上去了没"不该靠猜。
+    """
+    names = [n.strip() for n in (name or "").split(",") if n.strip()]
+    return {"ok": True, "state": manager.state, "busy": manager.busy,
+            "diag": await manager.attach_diagnose(names)}
+
+
 # ---------- 只用本地模型回一条(不进 ChatGPT/网页模型) ----------
 async def _run_local_turn(text: str, history: list[dict], pcfg: dict):
     """走与网页模型完全相同的事件协议: message_start -> delta* -> message_end,
@@ -533,92 +774,98 @@ async def api_world_state():
 
 @app.post("/api/world/apply")
 async def api_world_apply(req: WorldApplyRequest):
-    """World 模式: 用本地模型把网页模型(ChatGPT)的回答写成工作区文件改动。"""
-    if not req.text.strip():
+    """World 模式: 把网页模型回答里的文件改动**机械地整理**出来, 交给用户决定写不写。
+
+    这里**不调用任何模型**: 本地模型不写代码、也不判断该改什么 —— 程序只把回答里的
+    代码块和文件名对上(内容**原样照抄**, 一个字不改), 列成卡片让用户自己勾选。
+    以前是叫本地模型"按方案写出改动", 于是"你好"也能编出一份没人要的改动清单。
+    """
+    if not req.text.strip() and not any((t or "").strip() for t in (req.extra_texts or [])):
         return JSONResponse({"error": "没有可落盘的回答"}, status_code=400)
-    pcfg = settings.load().get("planner", {})
-    is_local = (pcfg.get("type") in ("api", "local")) and (
-        pcfg.get("type") == "local" or bool(pcfg.get("api_key")))
-    if not is_local:
-        return JSONResponse({"error": "落盘/自测需要一个能读懂代码的模型: 打开设置 → 规划模型类型选"
-                                      "「本地模型」(点「检测本地模型」自动填好) 或「API」(填 Key)。"
-                                      "这是全局设置, 所有会话共用, 换窗口不受影响。"},
-                            status_code=400)
-    _world_state["apply"] = {"action": "start", "text": "正在把 ChatGPT 的回答落实成文件改动…",
-                             "ts": time.time()}
-    _world_state["verify"] = None
-    await broadcast(events.event("world", stage="apply", action="start",
-                                 text="正在把 ChatGPT 的回答落实成文件改动…"))
-    repo = (settings.load().get("engine") or {}).get("repo", "")
     tree = workspace.walk_files()
-    # 从回答里认出要改的文件, 把它们当前的内容一起给本地模型(否则它没法给出完整内容)
-    targets = engineer.guess_paths(req.text, tree)
-    contents: list[tuple[str, str]] = []
-    for p in targets:
-        try:
-            data = workspace.read_file(p)
-        except Exception:  # noqa: BLE001
+    items: list[dict] = []
+    loose = 0
+    for extra in (req.extra_texts or [])[:4]:           # 前面几条回答: 先整理, 标上"来自上一条"
+        if not (extra or "").strip():
             continue
-        if not data.get("binary"):
-            contents.append((p, data.get("text") or ""))
-    if targets:
-        log.info("world apply: 目标文件 %s", ", ".join(targets))
-    # ChatGPT 只给了思路、没给代码时, 落盘的代码其实是本地模型自己写的 ——
-    # 以前界面上看不出来, 用户会以为"ChatGPT 什么都没发, 怎么就写进去了"。
-    self_authored = not _answer_has_code(req.text)
-    self_note = ("ChatGPT 的回答里没有代码(只有说明/思路), 这些改动由本地模型按方案自己编写"
-                 if self_authored else "")
-    if self_authored:
-        log.info("world apply: ChatGPT 的回答里没有代码, 改动由本地模型自编")
-    prompt = engineer.apply_prompt(req.task, req.text, tree, repo, contents)
-    try:
-        ans = await planner.ask(pcfg, prompt)
-    except planner.PlannerError as exc:
-        return JSONResponse({"error": "本地模型调用失败: " + str(exc)}, status_code=502)
-    obj, src = engineer.extract_manifest(ans or "")
-    if obj is None:
-        return JSONResponse({"error": "本地模型没能给出改动清单(" + src + ")",
-                             "raw": (ans or "")[-2000:]}, status_code=422)
-    if not (obj.get("files") or []):      # 空手而归: 再催一次
-        try:
-            hint = ("\n\n(回答里提到的文件是: " + ", ".join(targets) + ")") if targets else ""
-            ans2 = await planner.ask(pcfg, prompt + hint + "\n\n" + engineer.EMPTY_MANIFEST_NUDGE)
-            obj2, _src2 = engineer.extract_manifest(ans2 or "")
-            if obj2 is not None and (obj2.get("files") or []):
-                obj = obj2
-        except planner.PlannerError:
-            pass
-        if not (obj.get("files") or []):
-            log.info("world apply: 空清单, 本地模型原话: %s", (ans or "")[-400:].replace("\n", " "))
-    if req.dry_run:                      # 只给方案: 让界面弹确认框
+        more, l = engineer.extract_code_files(extra, tree)
+        for it in more:
+            it["from_prev"] = True
+        items.extend(more)
+        loose += l
+    more, l = engineer.extract_code_files(req.text, tree)
+    items.extend(more)                                  # 本条回答放最后 -> 同路径以本条的版本为准
+    loose += l
+    items = engineer._dedupe_items(items)
+    prev_paths = {it.get("path") for it in items if it.get("from_prev")}
+    if not items:
+        why = ("回答里有代码, 但没认出这些代码属于哪个文件"
+               if any(_answer_has_code(t) for t in
+                      list(req.extra_texts or []) + [req.text])
+               else "回答里没有代码, 也没有认出文件改动")
+        text = ("这条回答里没有可写入的文件(" + why + ") —— 已跳过: 没有调用本地模型, "
+                "也没有动任何文件" + ("; 可以让 ChatGPT 在代码块上写明文件名再来" if loose else ""))
+        _world_state["apply"] = {"action": "skipped", "no_changes": True, "reason": why,
+                                 "text": text, "loose": loose, "files": [], "empty": True,
+                                 "ts": time.time()}
+        _world_state["verify"] = None
+        await broadcast(events.event("world", stage="apply", action="skipped",
+                                     no_changes=True, reason=why, text=text,
+                                     files=[], loose=loose, empty=True, ts=time.time()))
+        log.info("world apply: 跳过(没认出可写入的文件): %s (loose=%d)", why, loose)
+        return {"ok": True, "no_changes": True, "reason": why, "text": text, "loose": loose,
+                "dry_run": bool(req.dry_run), "files": [], "empty": True,
+                "message": "", "applied": [], "skipped": []}
+
+    obj = {"message": "", "files": items}
+    if req.dry_run:                      # 只整理出来给用户看: 写不写由他勾选
         files = engineer.preview_manifest(obj)
-        contents = {str(it.get("path")): it.get("content") for it in (obj.get("files") or [])}
+        contents = {str(it.get("path")): it.get("content") for it in items}
         for f in files:
             if not f.get("content"):
                 f["content"] = contents.get(f.get("path"), "")
-        log.info("world preview: %d file(s)", len(files))
-        # 事件化: 刷新过的页面也能看到这一步(否则会一直停在"正在…")
-        payload = {"action": "preview", "empty": not files, "text": obj.get("message") or "",
-                   "selfAuthored": self_authored, "note": self_note,
+            f["fromPrev"] = f.get("path") in prev_paths      # 内容来自"前面那条回答"(卡片上标一下)
+        # 记下这批内容(原样), 供卡片上"写入工作区"一键落盘用
+        _last_extract.clear()
+        _last_extract.extend(items[:400])
+        log.info("world preview: 整理出 %d 个文件改动(没认出文件名的代码块 %d 段)", len(files), loose)
+        payload = {"action": "preview", "empty": not files, "text": "", "loose": loose,
                    "files": [{k: f.get(k) for k in
                               ("op", "path", "add", "del", "size", "unchanged", "error",
-                               "force", "realOp")}
+                               "force", "realOp", "fromPrev")}
                              for f in files], "ts": time.time()}
         _world_state["apply"] = payload
+        _world_state["verify"] = None
         await broadcast(events.event("world", stage="apply", **payload))
-        return {"ok": True, "dry_run": True, "message": obj.get("message") or "",
-                "files": files, "empty": not files,
-                "selfAuthored": self_authored, "note": self_note}
-    applied, skipped, diffs = engineer.apply_manifest(obj)
-    payload = {"action": "applied", "applied": applied, "skipped": skipped,
-               "text": obj.get("message") or "", "selfAuthored": self_authored,
-               "note": self_note, "ts": time.time()}
+        return {"ok": True, "dry_run": True, "message": "", "files": files,
+                "empty": not files, "loose": loose, "applied": [], "skipped": []}
+
+    applied, skipped, diffs = engineer.apply_manifest(obj)     # 自动模式: 写"程序整理出来的"那些
+    payload = {"action": "applied", "applied": applied, "skipped": skipped, "text": "",
+               "ts": time.time()}
     _world_state["apply"] = payload
     await broadcast(events.event("world", stage="apply", **payload))
     log.info("world apply: %d applied, %d skipped", len(applied), len(skipped))
-    return {"ok": True, "message": obj.get("message") or "", "applied": applied,
-            "skipped": skipped, "diffs": diffs,
-            "selfAuthored": self_authored, "note": self_note}
+    return {"ok": True, "message": "", "applied": applied, "skipped": skipped, "diffs": diffs}
+
+
+@app.post("/api/world/apply_all")
+async def api_world_apply_all():
+    """把**最近一次整理出来的**文件改动全部写进工作区(卡片上那个"写入工作区"按钮用)。
+
+    内容就是程序从回答里原样抄下来的那些, 一个字都不改、也不经过本地模型;
+    毁坏防护照旧(被拦下的条目会跳过并如实回报)。
+    """
+    if not _last_extract:
+        return JSONResponse({"ok": False, "error": "还没有整理过任何回答(先在 World 模式里发一条, "
+                                                   "或点卡片上的「重新整理这条回答」)"}, status_code=400)
+    applied, skipped, diffs = engineer.apply_manifest({"files": list(_last_extract)})
+    payload = {"action": "applied", "applied": applied, "skipped": skipped, "text": "",
+               "ts": time.time()}
+    _world_state["apply"] = payload
+    await broadcast(events.event("world", stage="apply", **payload))
+    log.info("world apply_all: %d applied, %d skipped", len(applied), len(skipped))
+    return {"ok": True, "applied": applied, "skipped": skipped, "diffs": diffs}
 
 
 @app.post("/api/world/commit")
@@ -960,11 +1207,14 @@ def _cleanup_verify_dir(path, existed_before: bool) -> bool:
 
 
 def _repair_note(rounds: list[dict]) -> str:
-    """验证失败、本地模型却一次都没动手改时, 逼它自己修的提示词。"""
+    """验证失败、命令又没跑出可判定结论时, 逼它**换命令继续找证据**的提示词。
+
+    注意: 这里不再要求它"动手改代码" —— 本地模型不写代码, 改代码只能由用户在卡片上决定。
+    """
     last = next((r for r in reversed(rounds) if r.get("action") == "run" and r.get("code")), None)
-    return ("[验证失败了, 但你一次都没有动手改过代码] 这不是\"命令跑不了\"那么简单, 是刚才的改动没做对 —— "
-            "请用 fix 把相关文件改对(files 里给**完整**内容), 然后重新跑一条命令证明它成立; "
-            "不要只换命令重跑、也不要只写解释。\n"
+    return ("[验证失败了, 但你还没拿出可判定的结论] 别急着收工 —— 换一条能真正跑出证据的命令"
+            "(项目自带测试 / 刚构建出来的产物 / .verify/ 下的临时验证程序), 或者用 done 如实说明"
+            "「问题出在哪个文件、要让用户改什么」; 不要用 fix(你不能改代码), 也不要只写解释。\n"
             "失败的命令: " + str((last or {}).get("command") or "(见上一轮)") +
             "\n输出(截断):\n" + str((last or {}).get("output") or "")[-3000:])
 
@@ -986,6 +1236,11 @@ async def api_world_verify(req: WorldVerifyRequest):
     """本地模型自己验证项目: 挑构建/测试命令 -> 看输出 -> 自己改 -> 直到通过。"""
     if not (req.task.strip() or req.answer.strip() or req.applied):
         return JSONResponse({"error": "没有可验证的内容"}, status_code=400)
+    # 【严格门槛】没有任何落盘改动、回答里也没有代码 = 这次没东西可验证: 别叫本地模型白跑命令。
+    # (用户明确选了"只自测"时前端会带 force=true, 那条路照旧。)
+    if not req.applied and not req.force and not _answer_has_code(req.answer or ""):
+        return JSONResponse({"error": "这次没有任何文件改动, 回答里也没有代码 —— 已跳过验证"
+                                      "(没有调用本地模型, 也没有跑任何命令)"}, status_code=400)
     pcfg = settings.load().get("planner", {})
     if not ((pcfg.get("type") in ("api", "local")) and
             (pcfg.get("type") == "local" or pcfg.get("api_key"))):
@@ -1009,12 +1264,12 @@ async def api_world_verify(req: WorldVerifyRequest):
     i = 0
     while True:
         if i >= max_rounds + repair_extra:
-            # 失败了却一次都没动手改 -> 别急着甩给网页模型, 先逼它自己修(本地能修的就本地修)
+            # 失败了却还没拿出结论 -> 再给两轮"换命令找证据"(它不能改代码, 所以不叫它修)
             if real_error_seen and local_fixes == 0 and repair_extra == 0:
                 repair_extra = repair_budget
                 last_cmd, last_out = "", _repair_note(rounds)
                 await broadcast(events.event("world", stage="verify", action="repair",
-                                             text="本地模型还没动手改过, 再让它自己修 " + str(repair_budget) + " 轮"))
+                                             text="还没拿到可判定的结论, 再让它换命令找 " + str(repair_budget) + " 轮证据"))
                 continue
             gave_up = True
             break
@@ -1094,23 +1349,28 @@ async def api_world_verify(req: WorldVerifyRequest):
                 real_error_seen = True       # 命令本身没问题却失败了 = 改动还没做对, 该它自己修
             await broadcast(events.event("world", stage="verify", round=i, action="run-done",
                                          command=cmd, code=code, text=out[-1500:]))
-            # 失败时把话说明白: 这很可能是**你刚才的改动**不对, 用 fix 自己改, 别只换命令重跑
+            # 失败时把话说明白 —— 但**不许它自己写代码**(本地模型只跑命令、看输出、报问题)
             last_cmd, last_out = cmd, (out if code == 0 else (
                 "这条命令失败了, 先判断是哪种:\n"
                 "(1) 命令本身在这台机器上用不了 / 路径或语法写错 -> 换一条 Windows 命令重试(run);\n"
-                "(2) 命令没问题、输出确实是编译/测试/验证失败 -> **那就是你刚才的改动不对, 直接用 fix 把文件改对**"
-                "(你手上有完整内容, 别只换命令重跑、也别只解释), 改完再跑一条命令证明它成立。\n\n" + out))
+                "(2) 命令没问题、输出确实是编译/测试/验证失败 -> 把**结论**说清楚(哪一步、什么报错、"
+                "要让用户改哪个文件的什么位置), 但**不要用 fix**: 你不能改代码。\n\n" + out))
             continue
         if action == "fix":
-            local_fixes += 1                 # 它自己动手了
-            applied, skipped, _ = engineer.apply_manifest({"files": obj.get("files") or [],
-                                                            "message": obj.get("message") or ""})
-            rounds.append({"round": i, "action": "fix", "applied": applied, "skipped": skipped,
+            # 【硬规矩】本地模型**不写代码**: 它想改的内容一个字都不落盘, 只作为"建议"报给用户,
+            # 写盘必须由用户在卡片上决定(或让 ChatGPT 给新版本)。
+            local_fixes += 1
+            wanted = engineer.preview_manifest({"files": obj.get("files") or []})
+            rounds.append({"round": i, "action": "fix-blocked", "suggested": wanted,
                            "text": obj.get("message") or ""})
-            await broadcast(events.event("world", stage="verify", round=i, action="fix-done",
-                                         applied=applied, skipped=skipped,
-                                         text=obj.get("message") or ""))
-            applied_txt += "\n" + "\n".join(f"- {a.get('op')} {a.get('path')}" for a in applied)
+            await broadcast(events.event("world", stage="verify", round=i, action="fix-blocked",
+                                         suggested=[{k: f.get(k) for k in ("op", "path", "size")}
+                                                    for f in wanted],
+                                         text="本地模型想改代码, 已拦住(写不写由你决定)"))
+            last_cmd, last_out = "", (
+                "[已拦住: 你不能改文件] 本地模型不写代码 —— 不要再用 fix。请改用 run 继续找证据, "
+                "或者用 done 如实说明「问题在哪、要用户改哪个文件」; 需要新代码就让用户把 ChatGPT "
+                "的版本写进去。")
             continue
         if action == "done":
             ev_txt = _evidence_text(obj)
@@ -1214,8 +1474,8 @@ async def api_world_verify(req: WorldVerifyRequest):
         reason = "rounds-exhausted"
     tail = {
         "ok": "本地模型确认项目跑通了(有验收点 + 证据)",
-        "real-error": ("本地模型自己改了 " + str(local_fixes) + " 次也没能修好(有真实报错)"
-                       if local_fixes else "没能自己搞定(有真实报错)"),
+        "real-error": ("本地模型想改 " + str(local_fixes) + " 次代码(已被拦住: 本地模型不写代码), "
+                       "项目里仍有真实报错" if local_fixes else "没能自己搞定(有真实报错)"),
         "blocked": "验证被安全策略拦住了(命令被拒), 没能验证",
         "parse-fail": "本地模型没给出可解析的验证决策, 验证没做完",
         "no-checks": "验证没做完: 它没先定出可判定的验收点, 「通过」没有判定标准",
@@ -1357,6 +1617,35 @@ async def api_conversations(more: int = 0):
     items = await manager.conversations(more=bool(more))
     return {"ok": True, "provider": manager.provider.id,
             "current": manager.conversation_id(), "items": items, "more": bool(more)}
+
+
+@app.post("/api/handoff/preview")
+async def api_handoff_preview():
+    """只汇总不发送: 看看"接力上下文"长什么样(排障 / 手动接力用)。
+
+    真正的自动接力在站点上下文到上限、自动另开窗口的那一刻做(见 `_handoff_context`)。
+    """
+    if manager.state != "logged_in":
+        return JSONResponse({"ok": False, "error": "浏览器未就绪/未登录"}, status_code=503)
+    if not await manager.ensure_alive():
+        return JSONResponse({"ok": False, "error": "桥接浏览器窗口已关闭"}, status_code=503)
+    ctx = await _handoff_context(manager)
+    return {"ok": bool(ctx), "chars": len(ctx), "context": ctx,
+            "error": "" if ctx else "没有可汇总的对话, 或者没配「规划模型」"}
+
+
+@app.get("/api/conversations/messages")
+async def api_conversation_messages():
+    """把站点当前这段对话**读回来**(bridge 的本地记录只包含它自己发出去的那些)。
+
+    "消息不同步"就是这儿来的: 你在站点窗口里直接发的、或站点自己产生的内容, 只有页面上有。
+    """
+    if manager.state != "logged_in":
+        return JSONResponse({"ok": False, "error": "浏览器未就绪/未登录"}, status_code=503)
+    if not await manager.ensure_alive():
+        return JSONResponse({"ok": False, "error": "桥接浏览器窗口已关闭, 请点左下角「启动并登录」重新打开"},
+                            status_code=503)
+    return await manager.read_conversation()
 
 
 @app.post("/api/conversations/open")

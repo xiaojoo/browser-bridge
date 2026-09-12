@@ -111,6 +111,30 @@ async def main() -> int:
         chips3 = await page.evaluate("() => document.querySelectorAll('#chips .chiprow').length")
         if chips3 != 2:
             bad.append("点 × 没有移除条目: " + str(chips3))
+
+        # 5) 【回归】拖到**输入框(textarea)**上: dragover/drop 会冒泡到 .composer,
+        #    以前 .composer 和 #input 各挂了一次监听 -> 同一个文件被加两次
+        #    (用户实际遇到的: "拖动文件到输入框, 出现两个同样的文件")。
+        #    注意上面第 1 步是往 .composer 上派发的, 所以以前这条路径没被覆盖到。
+        before = await page.evaluate("() => document.querySelectorAll('#chips .chiprow').length")
+        hl = await page.evaluate(r"""() => {
+          const dt = new DataTransfer();
+          dt.items.add(new File(["once"], "再拖一次.txt", { type: "text/plain" }));
+          const el = document.getElementById("input");
+          el.dispatchEvent(new DragEvent("dragover", { bubbles: true, cancelable: true, dataTransfer: dt }));
+          const on = document.querySelector(".composer").classList.contains("drop-on");
+          el.dispatchEvent(new DragEvent("drop", { bubbles: true, cancelable: true, dataTransfer: dt }));
+          return { highlight: on };
+        }""")
+        await page.wait_for_timeout(400)
+        names5 = await page.evaluate("() => Array.from(document.querySelectorAll('#chips .chiprow .nm')).map(e => e.textContent)")
+        n_new = names5.count("再拖一次.txt")
+        print(f"拖到输入框上: {before} -> {len(names5)} 个, 新文件出现 {n_new} 次, 拖拽中高亮 {hl['highlight']}")
+        print("  chips:", json.dumps(names5, ensure_ascii=False))
+        if n_new != 1 or len(names5) != before + 1:
+            bad.append(f"拖到输入框上被加了 {n_new} 次(应 1 次): " + json.dumps(names5, ensure_ascii=False))
+        if not hl["highlight"]:
+            bad.append("在输入框上拖着的时候没有高亮提示")
         await browser.close()
 
     if bad:

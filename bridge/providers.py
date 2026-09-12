@@ -21,6 +21,7 @@ class Provider:
     new_chat_names: tuple = ("New chat", "新对话")
     conversation_pattern: str = ""  # URL 中会话 id 的路径段, 如 "/chat/" 或 "/c/"
     snapshot_selector: str = ".ds-markdown, [class*=\"ds-markdown\"]"  # DOM 快照正文节点
+    conv_selector: str = ""          # 读回整段对话用: 每条消息的选择器(空 = 该站点不支持)
 
 
 PROVIDERS: list[Provider] = [
@@ -56,6 +57,7 @@ PROVIDERS: list[Provider] = [
         conversation_pattern="/c/",
         snapshot_selector='[data-message-author-role="assistant"] .markdown, '
                           '[data-message-author-role="assistant"]',
+        conv_selector='[data-message-author-role]',       # 用户/助手每条都带这个属性
     ),
 ]
 

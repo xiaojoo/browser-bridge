@@ -33,6 +33,7 @@ let wsAppliedConv = null;                // 上一次按哪个会话应用过工
    把"上次那个会话"的记录当成当前会话捡回来。按标签页记着, 刷新后同样是干净的。 */
 let freshOnConnect = false;
 let sawDisconnected = false;             // 本页里见过"未连接"状态 -> 之后的"已连接"才算一次新连接
+let lastSiteConvMismatch = null;         // 上一次提示过的"站点停在另一条会话"
 const FRESH_KEY = "wlb.fresh.v1";
 function freshFlag() {
   try { return sessionStorage.getItem(FRESH_KEY) === "1"; } catch (e) { return freshOnConnect; }
@@ -192,8 +193,9 @@ function ensureSession(conv) {
 /* 存历史用的紧凑卡片: 保留结论和行文字, 长详情只留给最近两轮
    (否则几张大卡片就把这一段撑爆, 旧的会被整段丢掉 —— 表现就是"刷新后卡片没了") */
 function cardForStore(card, keepDetail) {
-  // 存之前先去重: 以前每次刷新同步状态都会把同一批结果追加一遍, 存进历史的行越积越多
-  const rows = dedupeWorldRows(card.rows || []).slice(-12).map(r => ({
+  // 存之前先去重: 以前每次刷新同步状态都会把同一批结果追加一遍, 存进历史的行越积越多。
+  // 行数上限跟卡片一致(文件清单要能整份留在历史里, 以前只留 12 行 -> 刷新后 36 个文件只剩 12 个)。
+  const rows = dedupeWorldRows(card.rows || []).slice(-WORLD_MAX_ROWS).map(r => ({
     mark: String(r.mark || "").slice(0, 4),
     text: String(r.text || "").slice(0, 160),
     cls: String(r.cls || "").slice(0, 12),
@@ -201,7 +203,8 @@ function cardForStore(card, keepDetail) {
     detailsText: keepDetail ? String(r.detailsText || "").slice(0, 800) : "",
   }));
   return { title: String(card.title || "").slice(0, 80), count: String(card.count || "").slice(0, 40),
-           foot: String(card.foot || "").slice(0, 240), busy: false,
+           foot: String(card.foot || "").slice(0, 240), busy: false, folded: !!card.folded,
+           autoPreview: !!card.autoPreview, fileCount: card.fileCount || 0,
            wid: card.wid || "", rows: rows };
 }
 
@@ -320,7 +323,8 @@ function renderHistoryFor(prov, conv, sid) {
   if (transcript.length) scrollBottom();
   buildConvNav();
   syncScrollbar();
-  if (typeof applyConvWorkspace === "function") applyConvWorkspace(false);   // 切会话 -> 切回它的工作区
+  // 这里**故意不碰工作区**: 会话变化可能是站点自己换的(限流后自动另开窗口、分配新 id…),
+  // 只有用户主动点开某个会话时, 才由 openRemote/openGroup 去切那条会话自己的工作区。
 }
 function syncHistoryView(force) {
   const prov = providerKey();
@@ -396,12 +400,162 @@ async function loadConversations(more) {
     if (more) convExhausted = items.length <= convItems.length;   // 站点那边翻不出新的了
     convItems = items;
     if (!more) { convShown = CONV_PAGE; convExhausted = false; }
-    if (j.current !== undefined && j.current !== state.conversation_id) state.conversation_id = j.current;
+    if (j.current !== undefined && j.current !== state.conversation_id) {
+      // 站点窗口**自己**停在了另一条会话(你在窗口里点过别的会话 / 上次自动另开窗口)。
+      // 以前这里静默改 state.conversation_id; 后来我改成"把画面也切过去" —— 那样更糟:
+      // 刚发完消息时画面被切走, 看着就是"消息闪一下没了"。
+      // 现在: **不切画面**, 只提示一句; 真正发消息之前会先把站点切回你正在看的那条
+      // (见 send() 里的 alignSiteConversation())。
+      const siteConv = j.current;
+      if (freshFlag()) {                          // 刚连接: 站点可能还停在上次那条, 跟着它走
+        state.conversation_id = siteConv;
+        renderHistoryFor(prov, liveConvKey(), null);
+      } else if (lastSiteConvMismatch !== siteConv) {
+        lastSiteConvMismatch = siteConv;
+        const it = convItems.find(i => i.id === siteConv) || {};
+        toast("站点窗口现在停在另一条会话" + (it.title ? "「" + it.title + "」" : "") +
+              "；你在这儿发消息时会先把它切回你正在看的这条", "warn");
+        console.log("[bridge] 站点会话与界面不一致:", state.conversation_id, "<->", siteConv);
+      }
+    } else {
+      lastSiteConvMismatch = null;
+    }
   } catch (e) {
     if (!more) convItems = [];           // 读不到站点列表就只显示本地记录
   }
   renderConversations();
 }
+/* 把站点那段对话读回来, 和本地记录合并 —— 修"消息不同步"。
+   bridge 的消息列表只有**从它自己发出去**的那些; 你在站点窗口里直接发的、或者站点自己
+   产生的内容(继续生成/重新生成), 只有页面上有, 所以两边看起来对不上。
+   合并规则: 站点那份是骨架, 本地对应的条目复用(保留卡片/光标锚点), 站点多出来的按顺序
+   补进原位, 本地独有的(执行卡片等)留在原地。 */
+async function syncFromSite(quiet) {
+  let r;
+  try { r = await (await fetch("/api/conversations/messages")).json(); }
+  catch (e) { if (!quiet) toast("读站点对话失败: " + e.message, "err"); return { added: -1, fixed: 0 }; }
+  if (!r.ok) { if (!quiet) toast(r.error || "读站点对话失败", "warn"); return { added: -1, fixed: 0 }; }
+  const site = (r.messages || []).filter(m => String(m.text || "").trim());
+  if (!site.length) {
+    if (!quiet) toast("站点当前这条会话里没有消息 —— 先在侧栏点开要同步的那条会话再来", "warn");
+    return { added: 0, fixed: 0, empty: true };
+  }
+  const norm = (s) => String(s || "").replace(/\s+/g, " ").trim();
+  // 同一条消息的判定: 相等, 或者**一条是另一条的前缀**(本地采集被截断时正好是站点的前缀)。
+  // 短文本不猜 —— 「确认」是「确认设计，开始编码」的前缀, 但那不是同一条。
+  const PREFIX_MIN = 40;
+  const isSame = (a, b) => {
+    if (!a || !b || a.role !== b.role) return false;
+    const x = norm(a.text), y = norm(b.text);
+    if (!x || !y) return false;
+    if (x === y) return true;
+    const short = x.length <= y.length ? x : y;
+    if (short.length < PREFIX_MIN) return false;
+    return x.startsWith(short) && y.startsWith(short);
+  };
+  const out = [];
+  // 1) 先给每条本地消息找站点里的位置(只向前找, **不消费**) —— 本地可能带着站点没有的历史
+  //    (比如"换窗口之前"那一段), 旧算法一边找一边往后塞, 于是站点那几条全被塞到最前面, 末尾
+  //    那条抓错的回答就留下来了。
+  const matchOf = new Array(transcript.length).fill(-1);
+  let cursor = 0;
+  transcript.forEach((m, i) => {
+    if (!m || m.role === "world") return;
+    for (let j = cursor; j < site.length; j++) {
+      if (isSame(m, site[j])) { matchOf[i] = j; cursor = j + 1; return; }
+    }
+  });
+  // 2) 以站点为骨架合并: 本地独有的留在原位; 对上的用站点那份(谁更全用谁);
+  //    紧跟在对上的消息之后、同角色却完全对不上、站点更长的本地回答 = "抓错了", 用站点的替换。
+  let added = 0, fixed = 0, lastSite = -1, aligned = false;
+  const emitSite = (j) => { out.push({ role: site[j].role, text: site[j].text }); added++; lastSite = j; };
+  transcript.forEach((m, i) => {
+    if (!m || m.role === "world") { out.push(m); return; }       // 执行卡片插在原地
+    const j = matchOf[i];
+    if (j >= 0) {
+      for (let k = lastSite + 1; k < j; k++) emitSite(k);        // 站点上排在它前面、本地没有的
+      const sm = site[j];
+      if (norm(sm.text).length > norm(m.text).length) {          // 本地被截断 -> 用站点的补全
+        out.push(Object.assign({}, m, { text: sm.text }));
+        fixed++;
+      } else {
+        out.push(m);
+      }
+      lastSite = j;
+      aligned = true;
+      return;
+    }
+    const nxt = site[lastSite + 1];
+    if (aligned && m.role === "assistant") {
+      // (a) 站点下一条同角色、内容对不上、更长 -> 本地这条抓成上一条了, 换成站点那条
+      if (nxt && nxt.role === "assistant" && !isSame(m, nxt)
+          && norm(nxt.text).length > norm(m.text).length + 20) {
+        emitSite(lastSite + 1);
+        fixed++;
+        return;
+      }
+      // (b) 站点已经配完(这条是**多出来的尾巴**)、而且它的内容在已经排好的列表里**重复**了
+      //     (典型: 采集把上一轮的回答又当成本轮答案, 那条回答站点里也有) -> 丢掉这条残影。
+      //     真正的"上一条回答"就在上面, 留着它只会让人以为"这条会话的最后一句是错的"。
+      const prev = site[lastSite];
+      const dup = out.some(o => o && o.role === m.role && isSame(o, m));
+      if (!nxt && i === transcript.length - 1 && dup && prev && prev.role === "assistant"
+          && !isSame(m, prev) && norm(prev.text).length > norm(m.text).length + 20) {
+        console.log("[bridge] 同步: 丢掉重复的抓错尾巴", norm(m.text).slice(0, 60));
+        fixed++;
+        return;
+      }
+    }
+    out.push(m);                                                // 本地独有(换窗口前那段等)
+    aligned = false;
+  });
+  for (let k = lastSite + 1; k < site.length; k++) emitSite(k);  // 站点最后多出来的补到最后
+  if (!added && !fixed) {
+    if (!quiet) toast("已和站点一致(本地 " + (out.length) + " 条 / 站点 " + site.length + " 条)", "info");
+    return { added: 0, fixed: 0 };
+  }
+  transcript = out;
+  histFlush();
+  renderHistoryFor(providerKey(), liveConvKey(), curSid || null);
+  const bits = [];
+  if (added) bits.push("补回 " + added + " 条");
+  if (fixed) bits.push("补全 " + fixed + " 条被截断/抓错的");
+  if (!quiet) toast("从站点同步: " + bits.join("、") + "(本地 " + out.length + " 条)", "info");
+  return { added: added, fixed: fixed };
+}
+
+/* 右上角那个 ⟳: **刷新并同步**。消息对不上时点它 ——
+   重连状态 -> 重拉会话列表(顺带发现"站点那边换了会话") -> 把站点那段对话读回来合并
+   -> 补正最近一轮本地执行(落盘/验证)的卡片状态。 */
+async function refreshAll() {
+  const before = state.conversation_id;
+  try {
+    const s = await (await fetch("/api/status")).json();
+    state = Object.assign({}, state, s);
+    refreshUi();
+  } catch (e) { /* 拿不到状态就跳过 */ }
+  // 用户主动刷新 = 不再处于"刚连接的空一屏": 清掉这个标记, 下面 loadConversations 才会
+  // 在"站点那边其实在另一条会话"时**真的把画面切过去**(否则它只静默改 id, 看着就是没同步)。
+  setFreshFlag(false);
+  try { await loadConversations(); } catch (e) { /* 列表拿不到不影响同步 */ }
+  if (state.conversation_id !== before) {
+    renderHistoryFor(providerKey(), liveConvKey(), null);      // 确保画面真的换到那条会话
+  }
+  const res = await syncFromSite(true);
+  const added = (res && res.added) || 0, fixed = (res && res.fixed) || 0;
+  try { await syncWorldState(); } catch (e) { /* 老后端没有这个接口就算了 */ }
+  if (added > 0 || fixed > 0) {
+    toast("已刷新并同步: 补回 " + added + " 条" + (fixed ? "、补全 " + fixed + " 条被截断/抓错的" : "") + "消息", "info");
+  } else if (res && res.empty) {
+    toast("已刷新会话列表; 站点当前那条会话里没有消息(先点开要同步的会话)", "warn");
+  } else if (added === 0) {
+    toast("已刷新: 本地记录与站点一致", "info");
+  } else {
+    toast("已刷新会话列表; 站点那段对话没读到(未登录 / 该站点还不支持)", "warn");
+  }
+  return res;
+}
+
 /* 会话列表滚到底: 先翻本地分页, 本地翻完再向站点要更多 */
 async function loadMoreConversations() {
   if (convLoadingMore) return;
@@ -659,6 +813,7 @@ async function openRemote(g, sid) {
     await loadConversations();
     renderHistoryFor(providerKey(), liveConvKey(), sid || null);
     renderConversations();
+    await applyConvWorkspace(false, true);     // 用户主动点开这条会话 -> 才切它自己的工作区
     toast("已切换到「" + g.title + "」, 可以继续在这个会话里聊", "info");
   } catch (e) { toast(e.message, "err"); }
 }
@@ -791,13 +946,15 @@ function fileDropTarget(el) {
     const files = e.dataTransfer && e.dataTransfer.files;
     if (!files || !files.length) return;
     e.preventDefault();
+    e.stopPropagation();          // 别再让外层再收一遍(否则同一个文件被加两次)
     composerBox.classList.remove("drop-on");
     addFiles(files);
     toast("已加入 " + files.length + " 个文件", "info");
   });
 }
+// 只挂一次(挂在 .composer 上): dragover/drop 会从输入框(textarea)冒泡上来 ——
+// 以前这里还挂了 inputEl, 两边各加一次, 拖到输入框上就变成"两个同样的文件"。
 fileDropTarget(composerBox);
-fileDropTarget(inputEl);
 // 拖到页面其它地方也不要让浏览器直接打开文件
 ["dragover", "drop"].forEach(t => document.addEventListener(t, (e) => {
   if (e.target === document || e.target === document.body) e.preventDefault();
@@ -1428,6 +1585,7 @@ function paintWorldCard(spec) {
   el.querySelector(".tcount").textContent = spec.count || "";
   el.querySelector(".tspin").style.display = spec.busy ? "" : "none";
   el.querySelector(".task-foot").textContent = spec.foot || "";
+  if (spec.folded) el.classList.add("folded");     // 默认折叠(点标题展开) —— 36 个文件的清单太占地方
   const list = el.querySelector(".task-list");
   // 历史里可能积了重复行(每次刷新同步状态都会追加一遍): 重画时顺手去重, 并把干净的写回历史
   const before = (spec.rows || []).length;
@@ -1450,6 +1608,9 @@ function paintWorldCard(spec) {
   });
   el.querySelector(".task-head").onclick = () => el.classList.toggle("folded");
   convEl.appendChild(el);
+  if (spec.autoPreview && spec.fileCount) {      // 刷新后重画也要有"写入工作区"按钮
+    addWriteAllButton({ el: el, spec: spec, foot: el.querySelector(".task-foot") }, spec.fileCount);
+  }
   scrollBottom();
   return el;
 }
@@ -1470,6 +1631,7 @@ function worldRowExists(card, text) {
   return (card.spec.rows || []).some(r => r.text === t);
 }
 let worldWid = 0;
+const WORLD_MAX_ROWS = 400;      // 卡片最多记多少行(文件清单要能列全, 以前 24 行会把 36 个文件砍掉一半)
 function handleFor(spec, el) {
   return { el: el, spec: spec, list: el ? el.querySelector(".task-list") : null,
            foot: el ? el.querySelector(".task-foot") : null,
@@ -1495,8 +1657,36 @@ function cardFor(prefix) {
   worldCards.push(c);
   return c;
 }
-function worldCard(title) {
-  const spec = { title: title, count: "", foot: "", busy: true, rows: [],
+/* 「写入工作区(N 个)」一键按钮: 加在卡片的脚注上。
+   预览卡(事件推来的那张)和它刷新后的重画都走这里 —— 否则刷新一次按钮就没了。 */
+function addWriteAllButton(card, n) {
+  if (!card || !card.el || !n) return;
+  if (card.el.querySelector(".task-btns")) return;
+  const btns = document.createElement("div");
+  btns.className = "task-btns";
+  const all = document.createElement("button");
+  all.className = "pri";
+  all.textContent = "写入工作区(" + n + " 个)";
+  all.title = "一键把上面这些文件全部写进工作区(内容就是回答里的原文, 被拦下的会跳过)";
+  all.onclick = async () => {
+    all.disabled = true;
+    setCardFoot(card, "正在写入工作区…", true);
+    try {
+      const r = await post("/api/world/apply_all", {});
+      const ap = (r.applied || []).length, sk = (r.skipped || []).length;
+      setCardFoot(card, "已写入 " + ap + " 个文件" + (sk ? ", 跳过 " + sk + " 个" : ""), false);
+      all.remove();
+    } catch (e) {
+      setCardFoot(card, "写入失败: " + e.message, false);
+      all.disabled = false;
+    }
+  };
+  btns.appendChild(all);
+  card.el.querySelector(".task-foot").appendChild(btns);
+}
+
+function worldCard(title, folded) {
+  const spec = { title: title, count: "", foot: "", busy: true, rows: [], folded: !!folded,
                  wid: "w" + (++worldWid) + "-" + Date.now().toString(36) };
   const el = paintWorldCard(spec);
   const entry = { role: "world", card: spec };      // 进历史: 刷新后还在
@@ -1535,7 +1725,7 @@ function worldRow(card, mark, text, cls, detailsText, detailsLabel) {
   if (!card) return null;
   const spec = { mark: mark, text: String(text || "").slice(0, 300), cls: cls || "",
                  detailsText: String(detailsText || "").slice(0, 4000), detailsLabel: detailsLabel || "" };
-  if (card.spec.rows.length < 24) card.spec.rows.push(spec);   // 卡片别无限长
+  if (card.spec.rows.length < WORLD_MAX_ROWS) card.spec.rows.push(spec);   // 卡片别无限长(但文件清单要够长)
   if (!card.list) { histFlush(); return null; }                // 只更新记录(画面下次重画)
   const row = document.createElement("div");
   row.className = "task-item" + (cls ? " " + cls : "");
@@ -1555,74 +1745,135 @@ function worldRow(card, mark, text, cls, detailsText, detailsLabel) {
   return row;
 }
 
-/* 落盘卡片: ChatGPT 没给代码时, 把"代码是谁写的"说清楚(否则用户会以为凭空写入) */
-function noteSelfAuthored(card, ev) {
-  if (!card || !ev || !ev.selfAuthored) return;
-  const t = "注意: " + (ev.note || "ChatGPT 的回答里没有代码, 这些改动由本地模型自己编写");
-  if (!worldRowExists(card, t)) worldRow(card, "!", t, "err");
+/* 事件推来的那张"只读预览卡"和 worldPipeline 马上要画的"勾选卡"是同一件事 ->
+   留勾选卡, 把只读那张(连同历史记录)去掉, 免得同一批文件出现两遍。 */
+function dropAutoPreviewCard() {
+  const spec = lastWorldSpec("本地落盘");
+  if (!spec || !spec.autoPreview) return;
+  const el = spec.wid ? document.querySelector('#conv .task-card[data-wid="' + spec.wid + '"]') : null;
+  if (el) el.remove();
+  transcript = transcript.filter(m => !(m && m.role === "world" && m.card === spec));
   histFlush();
 }
 
-/* 确认框: 列出本地模型建议的改动, 逐条勾选 */
-function confirmApply(files, hasVerify) {
-  return new Promise((resolve) => {
-    const ov = $("applyOverlay"), list = $("applyList");
-    const risky = files.filter((f) => f.op === "warn").length;
-    $("applyNote").textContent = "本地模型准备好了下面这些步骤, 勾选后才会执行; 点「取消」就直接结束(什么都不做)。" +
-      (risky ? " 注意: 有 " + risky + " 项被标成「疑似改坏项目」(大幅截断/路径写错), 默认不勾选 —— 看清原因再决定。" : "");
-    list.innerHTML = "";
-    if (!files.length) {
-      const empty = document.createElement("div");
-      empty.className = "hint2";
-      empty.textContent = "(这次回答里没有具体文件改动, 只有自测)";
-      list.appendChild(empty);
-    }
-    files.forEach((f) => {
-      const it = document.createElement("div");
-      it.className = "apply-item";
-      it.innerHTML = '<input type="checkbox"' + (f.op === "warn" ? "" : " checked") +
-        ' /><div class="ai-main">' +
-        '<div class="ai-head"><span class="ai-op"></span><span class="ai-path"></span>' +
-        '<span class="ai-meta"></span></div></div>';
-      it.querySelector(".ai-op").textContent = f.op;
-      it.querySelector(".ai-op").classList.add(f.op);
-      it.querySelector(".ai-path").textContent = f.path;
-      it.querySelector(".ai-meta").textContent = (f.op === "warn" || f.op === "invalid")
-        ? ("⚠ " + (f.error || "这条被拦下了") +
-           (f.op === "warn" ? " · +" + (f.add || 0) + " / -" + (f.del || 0) + " 行 · " + (f.size || 0) + "B" : ""))
-        : (f.op === "delete")
-          ? ("删除 " + (f.oldLines || 0) + " 行")
-          : ("+" + (f.add || 0) + " / -" + (f.del || 0) + " 行 · " + (f.size || 0) + "B" +
-             (f.unchanged ? " · 内容没变化" : ""));
-      if (f.preview) {
-        const d = document.createElement("details");
-        d.innerHTML = "<summary>查看新内容</summary><pre></pre>";
-        d.querySelector("pre").textContent = f.preview;
-        it.querySelector(".ai-main").appendChild(d);
-      }
-      list.appendChild(it);
-    });
-    if (hasVerify) {                                  // 第二类步骤: 代码自测
-      const v = document.createElement("div");
-      v.className = "apply-item";
-      v.innerHTML = '<input type="checkbox" id="applyVerify" checked />' +
-        '<div class="ai-main"><div class="ai-head">' +
-        '<span class="ai-op update">自测</span>' +
-        '<span class="ai-path">本地模型自己构建/测试</span>' +
-        '<span class="ai-meta">挑命令 → 看输出 → 有报错自己改 → 直到通过</span>' +
-        '</div></div>';
-      list.appendChild(v);
-    }
-    ov.classList.add("show");
-    const boxes = () => Array.from(list.querySelectorAll("input"));
-    $("applyOk").onclick = () => {
-      const fileBoxes = boxes().filter(b => b.id !== "applyVerify");
-      const picked = files.filter((f, i) => fileBoxes[i] && fileBoxes[i].checked);
-      const vb = $("applyVerify");
-      ov.classList.remove("show");
-      resolve({ files: picked, verify: vb ? vb.checked : false });
+/* 这一条回答常常是"接着上一条"给的(ChatGPT 会从 `## 8. src/api/index.ts` 接着上一条的 1~7 写),
+   只整理当前这一条就会少掉前面那批文件 —— 整条消息看起来就"文件不全"。
+   这里把这条回答**之前**那几条带代码块的回答原文取回来(最多 limit 条), 交给服务端一起整理:
+   顺序是"早的在前", 同路径后面的版本覆盖前面的(服务端 _dedupe_items 就是这么做的)。 */
+function worldCarryTexts(answer, limit) {
+  const want = String(answer || "");
+  let idx = -1;
+  for (let i = transcript.length - 1; i >= 0; i--) {
+    const m = transcript[i];
+    if (m && m.role === "assistant" && String(m.text || "") === want) { idx = i; break; }
+  }
+  if (idx < 0) idx = transcript.length;         // 还没进历史(刚收到) -> 从末尾往前找
+  const out = [];
+  for (let i = idx - 1; i >= 0 && out.length < (limit || 2); i--) {
+    const m = transcript[i];
+    if (!m || m.role !== "assistant") continue;
+    if (!/```/.test(String(m.text || ""))) continue;    // 没代码块的回答不值得带
+    out.unshift(String(m.text));
+  }
+  return out;
+}
+
+/* 识别出的文件改动: 列成卡片放在**消息下面**, 让用户自己决定写哪几个。
+   内容全部来自 ChatGPT 的回答(程序只负责把代码块和文件名对上, 一个字不改);
+   本地模型不参与这一步, 也不写代码。 */
+function worldWriteCard(files, loose, opts) {
+  const o = opts || {};
+  const answerText = String(o.answer || "");
+  const carried = [];                       // 来自前面几条回答的文件(服务端标 fromPrev)
+  const rows = files.map((f) => {
+    // 服务端按"这条回答里有没有这段内容"给 fromPrev; 万一没有(老数据)就退回到文本里找路径
+    const fromPrev = (f.fromPrev !== undefined && f.fromPrev !== null)
+      ? !!f.fromPrev
+      : (!!answerText && answerText.indexOf(f.path) < 0);
+    if (fromPrev) carried.push(f.path);
+    const body = (f.op === "warn" || f.op === "invalid")
+      ? ("⚠ " + (f.error || "这条被拦下了"))
+      : (f.op === "delete" ? ("删除 " + (f.oldLines || 0) + " 行")
+         : ("+" + (f.add || 0) + " / -" + (f.del || 0) + " 行 · " + (f.size || 0) + "B" +
+            (f.unchanged ? " · 内容没变化" : "")));
+    return {
+      mark: f.op === "create" ? "＋" : (f.op === "delete" ? "−" : "✎"),
+      text: (fromPrev ? "上一条 · " : "") + f.path + "  " + body,
+      cls: (f.op === "warn" || f.op === "invalid") ? "err" : "done",
+      detailsText: f.content || f.preview || "",
+      detailsLabel: "查看文件内容",
     };
-    $("applySkip").onclick = () => { ov.classList.remove("show"); resolve(null); };
+  });
+  const spec = { title: "本地落盘 · 识别到的文件改动(写不写由你决定)",
+                 count: files.length + " 个文件", foot: "", busy: false, rows: rows,
+                 folded: files.length > 8,     // 文件多时默认折叠(点标题展开逐条勾选), 按钮一直在脚注上
+                 wid: "w" + (++worldWid) + "-" + Date.now().toString(36) };
+  const el = paintWorldCard(spec);
+  const card = Object.assign(handleFor(spec, el), { entry: { role: "world", card: spec } });
+  histPush(card.entry);
+  worldCards.push(card);
+
+  const list = el.querySelector(".task-list");
+  const boxes = [];
+  Array.from(list.querySelectorAll(".task-item")).forEach((row, i) => {
+    const f = files[i];
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    // 被拦下的默认不勾; 内容和工作区里一模一样(unchanged)的也不用勾(勾了也是空写一次)
+    box.checked = (f.op !== "warn" && f.op !== "invalid" && !f.unchanged);
+    box.title = "勾上 = 写入这个文件";
+    row.insertBefore(box, row.firstChild);
+    boxes.push({ f, box });
+  });
+  if (loose) {
+    const hint = document.createElement("div");
+    hint.className = "hint2";
+    hint.textContent = "还有 " + loose + " 段代码块没对上文件(命令/目录树/网址之类会落在这里, 不猜)"
+      + (carried.length ? "(这里面也算上了前面那条回答)" : "") + " —— "
+      + "需要的话让 ChatGPT 在代码块上写明文件名。";
+    list.appendChild(hint);
+  }
+
+  const foot = el.querySelector(".task-foot");
+  if (carried.length || files.length > 8) {
+    setCardFoot(card, (carried.length
+        ? ("本条回答 " + (files.length - carried.length) + " 个 + 前面回答 " + carried.length
+           + " 个(标了「上一条」; 内容没变化的默认不勾), ")
+        : ("共 " + files.length + " 个文件(点标题展开可逐条勾选), "))
+      + "内容都是回答里的原文", false);
+  }
+  const vlab = document.createElement("label");
+  vlab.className = "task-check";
+  vlab.innerHTML = '<input type="checkbox" checked /> 写入后自测(本地模型只跑命令看输出, 不改代码)';
+  const btns = document.createElement("div");
+  btns.className = "task-btns";
+  const ok = document.createElement("button");
+  ok.className = "pri";
+  ok.textContent = "写入选中的";
+  const skip = document.createElement("button");
+  skip.textContent = "全部跳过";
+  btns.append(ok, skip);
+  foot.append(vlab, btns);
+
+  return new Promise((resolve) => {
+    ok.onclick = () => {
+      const picked = boxes.filter(b => b.box.checked).map(b => b.f);
+      const verify = vlab.querySelector("input").checked;
+      btns.remove(); vlab.remove();
+      if (!picked.length) {
+        setCardFoot(card, "你没有勾选任何文件, 本次不写入", false);
+        resolve(null);
+        return;
+      }
+      setCardFoot(card, "按你的勾选写入…", true);
+      resolve({ files: picked, verify: verify, card: card });
+    };
+    skip.onclick = () => {
+      boxes.forEach(b => { b.box.checked = false; });
+      btns.remove(); vlab.remove();
+      setCardFoot(card, "你跳过了, 本次不写入任何文件", false);
+      resolve(null);
+    };
   });
 }
 
@@ -1630,7 +1881,7 @@ function confirmApply(files, hasVerify) {
 function handleApplyEvent(ev) {
   let card = cardFor("本地落盘");
   if (!card) {
-    card = worldCard("本地落盘(本地模型写入工作区)");
+    card = worldCard("本地落盘(从 ChatGPT 的回答里整理文件改动)", true);   // 默认折叠, 点标题展开全部
     if (!worldBusy) setCardFoot(card, "", false);             // 不是本页发起的: 不转圈
   }
   if (ev.action === "start") {
@@ -1638,17 +1889,22 @@ function handleApplyEvent(ev) {
     return;
   }
   if (ev.action === "preview") {
-    const files = ev.files || [];
-    noteSelfAuthored(card, ev);
-    if (!files.length) {
-      setCardFoot(card, "本地模型认为这次回答没有具体文件改动" +
-        (ev.text ? ": " + ev.text : "") + " —— 你可以选择只让它去项目里自测", false);
+    // 用户正在那张勾选卡片上决定写不写 -> 别重复画一遍文件行, 只更新脚注
+    if (card.el && card.el.querySelector(".task-btns")) {
+      setCardFoot(card, ev.text || "上面的文件改动请你决定写哪几个…", false);
       return;
     }
+    const files = ev.files || [];
+    if (!files.length) {
+      setCardFoot(card, "这条回答里没有可写入的文件" +
+        (ev.text ? ": " + ev.text : "") + " —— 没有动任何文件", false);
+      return;
+    }
+    const prevCount = files.filter(f => f.fromPrev).length;
     files.forEach(f => {
       const risky = (f.op === "warn" || f.op === "invalid");
       const text = (risky ? "⚠ " + String(f.error || "这条被拦下了") + " — " : "") +
-        f.op + " " + f.path +
+        (f.fromPrev ? "上一条 · " : "") + f.op + " " + f.path +
         (f.op === "delete" ? " (删除)" :
           " +" + (f.add || 0) + "/-" + (f.del || 0) + " 行 · " + (f.size || 0) + "B") +
         (f.unchanged ? " · 内容没变化" : "");
@@ -1657,13 +1913,16 @@ function handleApplyEvent(ev) {
     });
     setCardCount(card, files.length + " 个文件");
     const riskCount = files.filter(f => f.op === "warn" || f.op === "invalid").length;
-    setCardFoot(card, "本地模型建议 " + files.length + " 个文件改动" +
-      (riskCount ? " (其中 " + riskCount + " 项疑似改坏项目, 默认不勾选)" : "") + ", 等你确认步骤…", false);
+    setCardFoot(card, "从回答里整理出 " + files.length + " 个文件改动" +
+      (prevCount ? "(其中 " + prevCount + " 个来自前面那条回答)" : "") +
+      (riskCount ? " (其中 " + riskCount + " 项疑似改坏项目, 会被跳过)" : "") + ", 写不写由你决定", false);
+    card.spec.autoPreview = true;            // 只读预览卡: 外层要画"勾选卡"时可以把它去掉, 别两张一样
+    card.spec.fileCount = files.length;      // 让"写入工作区"按钮在刷新后重画时也出现
+    addWriteAllButton(card, files.length);
     return;
   }
   if (ev.action === "applied") {
     const applied = ev.applied || [], skipped = ev.skipped || [];
-    noteSelfAuthored(card, ev);
     // 同一批结果会从"事件 + 接口返回值 + 刷新后的状态同步"进来好几遍, 已经画过的不再画
     applied.forEach(a => {
       const t = a.op + " " + a.path + (a.size ? " (" + a.size + "B)" : "");
@@ -1766,70 +2025,84 @@ async function worldAfterAnswer(task, answer) {
   }
 }
 
+/* 网页模型的回答回来后: 把回答里的文件改动**机械地**整理出来 -> 列成卡片 -> 用户决定写不写。
+   本地模型不参与这一步(不写代码、也不判断该改什么); 只有"自测"那一步才会用到它(跑命令看输出)。 */
 async function worldPipeline(task, answer) {
-  const card = worldCard("本地落盘(本地模型写入工作区)");
-  setCardFoot(card, "正在把 ChatGPT 的回答落实成文件改动…", true);
   let confirm = true, settings = {};
   try {
     settings = await (await fetch("/api/settings")).json();
     confirm = !((settings.engine && settings.engine.confirm_apply) === "0");
   } catch (e) {}
   let r = { applied: [], skipped: [] };
+  let verify = false;
+  let card = null;                                  // 确认模式下=那张勾选卡片, 结果就写在它上面
+  // 这一条回答常常是"接着上一条"给的(ChatGPT 从 `## 8.` 接着上一条的 1~7 写):
+  // 把前面几条带代码的回答原文一起交给服务端整理(它按"早的在前"合并, 同路径本条的版本覆盖前面的),
+  // 卡片才列得全。extra_texts 里的文件由服务端标 fromPrev -> 行首标「上一条 ·」。
+  // 取 3 条: 这条会话里 vite.config.ts / tsconfig*.json 的内容在**再往前**那条回答里(实测),
+  // 只带 2 条就会"项目树里有、卡片里没有"。
+  const carry = worldCarryTexts(answer, 3);
   try {
-    if (confirm) {                                  // 先只拿方案 -> 弹确认框 -> 按勾选执行
-      const pv = await post("/api/world/apply", { task: task, text: answer, dry_run: true });
-      const files = pv.files || [];
-      noteSelfAuthored(card, pv);
-      setCardFoot(card, files.length
-        ? ("本地模型建议 " + files.length + " 个文件改动, 等你确认步骤…")
-        : ("本地模型认为这次回答没有具体文件改动" + (pv.message ? ": " + pv.message : "") +
-           " —— 你可以选择只让它去项目里自测"), false);
-      const choice = await confirmApply(files, true);
-      if (!choice) {                                 // 取消 = 直接结束
-        setCardFoot(card, "你取消了, 本次不做任何改动", false);
+    if (confirm) {
+      // 先只让服务端"整理"出文件清单(不写盘) -> 卡片列在消息下面 -> 用户勾选
+      const pv = await post("/api/world/apply",
+                            { task: task, text: answer, extra_texts: carry, dry_run: true });
+      if (pv.no_changes) {
+        const c = worldCard("本地落盘(从 ChatGPT 的回答里整理文件改动)");
+        setCardFoot(c, pv.text || "这条回答里没有可写入的文件, 已跳过", false);
+        // 认不出文件名时给个"重来"的口子: 整理规则可能刚修过, 或者让 ChatGPT 补上文件名后
+        // 想重试这一条(不用把整段回答再发一遍)。
+        const btns = document.createElement("div");
+        btns.className = "task-btns";
+        const again = document.createElement("button");
+        again.textContent = "重新整理这条回答";
+        again.onclick = () => { btns.remove(); worldPipeline(task, answer); };
+        btns.appendChild(again);
+        c.el.querySelector(".task-foot").appendChild(btns);
         return;
       }
-      if (!choice.files.length) {
-        setCardFoot(card, files.length ? "你没有勾选任何文件, 跳过写入" : "没有需要写入的文件", false);
-      } else {
-        r = await post("/api/world/commit", {
-          files: choice.files.map(f => ({ op: f.realOp || f.op, path: f.path,
-                                          content: f.content, force: !!f.force })),
-          message: pv.message || "",
-        });
-      }
-      if (!choice.verify) {                          // 没选自测 -> 到此结束
-        setCardFoot(card, (card.spec.foot ? card.spec.foot + " · " : "") + "你选择跳过自测, 到此结束", false);
-        return;
-      }
+      dropAutoPreviewCard();                        // 同一次整理别画两张卡
+      const pick = await worldWriteCard(pv.files || [], pv.loose || 0, { answer: answer });
+      if (!pick) return;                            // 用户跳过了(卡片上已经写明)
+      verify = pick.verify;
+      card = pick.card;
+      r = await post("/api/world/commit", {
+        files: pick.files.map(f => ({ op: f.realOp || f.op, path: f.path,
+                                      content: f.content, force: !!f.force })),
+        message: "",
+      });
     } else {
-      r = await post("/api/world/apply", { task: task, text: answer });
+      r = await post("/api/world/apply", { task: task, text: answer });   // 自动写入整理出来的改动
+      if (r.no_changes) return;
+      verify = true;
     }
   } catch (e) {
-    worldRow(card, "✗", "落盘失败: " + e.message, "err");
-    setCardFoot(card, "✗ 本地模型没能落盘(检查设置里的本地模型是否在跑)", false);
+    const c = card || worldCard("本地落盘(从 ChatGPT 的回答里整理文件改动)");
+    worldRow(c, "✗", "写入失败: " + e.message, "err");
+    setCardFoot(c, "✗ 没能写入(工作区不可写? 或插件被拦下)", false);
     return;
   }
+
   const applied = r.applied || [], skipped = r.skipped || [];
-  noteSelfAuthored(card, r);
-  if (applied.length || skipped.length) {
-    // 服务端已经把同一批结果作为事件广播过一遍(刷新过的页面靠它), 这里别再画第二行
+  if (!applied.length && !skipped.length) return;
+  if (!card) {                                      // 自动模式: 结果卡
+    card = worldCard("本地落盘(从 ChatGPT 的回答里整理文件改动)");
     applied.forEach(a => {
       const t = a.op + " " + a.path + (a.size ? " (" + a.size + "B)" : "");
       if (!worldRowExists(card, t)) worldRow(card, "✓", t, "done");
     });
     skipped.forEach(s => { if (!worldRowExists(card, s)) worldRow(card, "!", s, "err"); });
-    setCardCount(card, applied.length + " 个文件");
-  } else if (!confirm) {                 // 全自动模式且没有任何改动: 不留一张空卡片
-    card.el.remove();
+  }
+  setCardCount(card, applied.length + " 个文件");
+  setCardFoot(card, "应用 " + applied.length + " 项" +
+    (skipped.length ? ", 跳过 " + skipped.length + " 项" : ""), false);
+
+  if (!applied.length) return;                      // 一个都没写进去 -> 没什么可自测的
+  if (!verify) {                                    // 用户没勾"写入后自测"
+    setCardFoot(card, card.spec.foot + " · 你选择跳过自测, 到此结束", false);
     return;
   }
-  if (applied.length || skipped.length) {
-    setCardFoot(card, (r.message || "") + " · 应用 " + applied.length + " 项" +
-      (skipped.length ? ", 跳过 " + skipped.length + " 项" : ""), false);
-  }
-
-  await worldVerify(task, answer, applied, settings, card);
+  await worldVerify(task, answer, applied, settings, card, false);
 }
 
 /* 本地模型自己去验证这个项目: 挑构建/测试命令 -> 看输出 -> 自己改 -> 直到通过 */
@@ -1855,14 +2128,14 @@ function verifyWhy(v) {
   return "没能自己完成验证";
 }
 
-async function worldVerify(task, answer, applied, settings, card) {
+async function worldVerify(task, answer, applied, settings, card, force) {
   worldVerifyCard = null;
   let v;
   try {
     v = await post("/api/world/verify", {
       task: task, answer: answer, applied: applied,
       command: (settings.engine && settings.engine.test_cmd) || "",
-      max_rounds: 4,
+      max_rounds: 4, force: !!force,
     });
   } catch (e) {
     const c0 = worldVerifyCard || worldCard("本地验证(按需求验收点找证据)");
@@ -2281,6 +2554,7 @@ async function newChat() {
       return;
     }
     showFreshStart();                             // 远端已是新会话 -> 本地也从空白开始
+    await applyConvWorkspace(false, true);        // 用户主动新建会话 -> 才切它自己的工作区
     loadConversations();
     toast("已在 " + site + " 新建会话, 本地也跟着换新了", "info");
   } catch (e) { toast(e.message, "err"); }
@@ -2419,6 +2693,29 @@ function localHistory() {
     .slice(-20)
     .map(m => ({ role: m.role, text: String(m.text).slice(0, 8000) }));
 }
+/* 发消息之前先把"站点窗口停在的会话"对齐到"你正在看的这条"。
+   两边不一致时(你在站点窗口里点过别的会话 / 上次自动另开窗口 / 我这边实测留下的对话),
+   消息会发到**站点那条**去, 而记录记在你这条下 —— 随后刷新会话列表画面又被切走,
+   看着就是"消息闪一下没了"。所以先切回来再发。 */
+async function alignSiteConversation() {
+  if (!state.conversation_id || state.conversation_id === "~new") return true;
+  try {
+    const s = await (await fetch("/api/status")).json();
+    if (!s || s.state !== "logged_in") return true;
+    if (!s.conversation_id || s.conversation_id === state.conversation_id) return true;
+    const r = await post("/api/conversations/open",
+                         { key: state.conversation_id, url: state.conversation_url || "" });
+    if (r && r.current) {
+      state.conversation_id = r.current;
+      lastSiteConvMismatch = null;
+      console.log("[bridge] 发消息前把站点切回:", r.current);
+    } else {
+      toast("站点窗口停在另一条会话, 没能切回来 —— 这条消息可能会发到那边去", "warn");
+    }
+  } catch (e) { /* 切不动就算了, 别挡住发送 */ }
+  return true;
+}
+
 async function send() {
   if (sendingLock) return;            // 上一次发送还没结束
   const userText = getInputText();
@@ -2435,6 +2732,7 @@ async function send() {
     return;
   }
   syncHistoryView(true);        // 正在回看旧记录时, 发送前先回到远端当前会话
+  if (!localOnly) await alignSiteConversation();   // 站点窗口别停在别的会话上(否则消息会发错地方)
   // World 模式: 直接把输入作为工程任务交给执行器
   if (currentMode === "world") {
     // World 模式: 原始消息原样发给网页模型; 回答回来后由本地模型落盘 + 验证
@@ -2694,14 +2992,16 @@ async function wsPostRoot(path) {
     body: JSON.stringify({ path: path || "" }),
   });
 }
-/* 切会话/刷新后: 把工作区切回这条会话记住的那个。
-   关键: 这条会话**没有**单独设置过工作区时, 一根汗毛都不动 —— 以前这里会 POST 空路径
-   (= 恢复内置默认), 于是"新会话 / 换会话 / 站点换了个会话 id"就会把用户选的项目目录冲掉
-   (用户实际遇到过: 配置里的 H:\steward 被 silently 换成内置的 workspace/)。 */
-async function applyConvWorkspace(announce) {
+/* 换工作区目录**只有一条合法来源: 用户主动的动作** ——
+   主动点侧栏某个会话 / 主动新建会话 / 在工作区对话框里选目录。
+   连接站点、刷新页面、站点被限流后自动另开窗口、站点自己分配/切换会话 id…
+   这些"自己发生"的事一律不碰工作区目录(连 POST 都不发)。
+   以前这里是"会话一变就把工作区切回该会话记过的目录", 于是启动/连接时会把用户
+   正在用的项目目录悄悄换成**另一个会话**记过的目录(用户实际遇到过)。 */
+async function applyConvWorkspace(announce, userAction) {
   const conv = wsRootMapKey();
-  if (wsAppliedConv === conv && !announce) return;
   wsAppliedConv = conv;
+  if (!userAction) return;                  // 不是用户主动开的 -> 只记标记, 绝不动服务端
   let info;
   try { info = await wsFetch("/api/workspace"); } catch (e) { return; }
   wsApplied = info.root;
@@ -3123,7 +3423,7 @@ $("setClearKey").onclick = async () => {
   loadWorkspace();
   syncWorldState();                      // 把最近一轮落盘/验证结果补画到卡片上
   migrateHistory();                      // v1/v2 老记录 -> v3
-  applyConvWorkspace(false);             // 恢复这条会话记住的工作区
+  // 刷新页面不换工作区目录: 保持服务端当前那个(要换只能由用户主动点会话/选目录)
   syncHistoryView(true);                 // 恢复当前会话的记录(有记录就直接进消息区)
   showWelcome(transcript.length === 0 && !(histConv && histConv !== NEW_CONV));
   renderConversations();
@@ -3149,6 +3449,10 @@ $("setClearKey").onclick = async () => {
   window.addEventListener("resize", syncComposerSpace);
   const cBtn = $("convRefresh");
   if (cBtn) cBtn.onclick = () => { loadConversations(); toast("已刷新会话列表", "info"); };
+  const sBtn = $("convSync");
+  if (sBtn) sBtn.onclick = () => syncFromSite(false);
+  const rBtn = $("topRefresh");
+  if (rBtn) rBtn.onclick = () => refreshAll();
   setModeLabel();
   // 侧栏收起/展开(按钮 + 视口变窄自动隐藏)
   let sidebarVisible = window.innerWidth > 900;

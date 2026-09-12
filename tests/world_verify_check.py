@@ -1,6 +1,10 @@
 """World 模式: 本地模型自己验证项目(挑命令/看输出/自己改)。
 
 全程替身: 不联网、不跑真命令(命令用 cmd /c exit N 之类)。
+
+注意: 这里测的是**验证循环本身**(命令/证据/轮次/假通过防线), 不是"没东西可验证就别跑"那道
+门槛(那道门由 `tests/world_gate_check.py` 覆盖)。所以下面每个调用都显式带 `force=True` ——
+它的含义就是界面上那个「这次不改文件, 只让它去项目里自测」: 用户明确要求验证, 与落盘无关。
 """
 import asyncio
 import json
@@ -59,7 +63,7 @@ async def main() -> int:
         workspace.use_root(TMP_WS)
         res = await server.api_world_verify(server.WorldVerifyRequest(
             task="修一下 main", answer="把返回值改成 1", applied=[{"op": "update", "path": "main.cpp"}],
-            command="", max_rounds=4, timeout=20))
+            command="", max_rounds=4, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
         server.broadcast = orig_broadcast
@@ -71,24 +75,29 @@ async def main() -> int:
     if not res.get("ok"):
         bad.append("本地模型验证没有判为通过: " + json.dumps(res, ensure_ascii=False)[:300])
     acts = [r.get("action") for r in res["rounds"]]
-    if acts != ["run", "fix", "run", "done"]:
-        bad.append("验证轮次不对(应 run->fix->run->done): " + json.dumps(acts, ensure_ascii=False))
+    # 【硬规矩】本地模型**不写代码**: 它给的 fix 会被拦成 fix-blocked, 文件内容一个字都不变
+    if acts != ["run", "fix-blocked", "run", "done"]:
+        bad.append("验证轮次不对(应 run->fix-blocked->run->done): " + json.dumps(acts, ensure_ascii=False))
     if not any(r.get("code") == 1 for r in res["rounds"]):
         bad.append("第一轮应该拿到退出码 1")
-    if "int main(){return 1;}" not in (TMP_WS / "main.cpp").read_text(encoding="utf-8"):
-        bad.append("本地模型给出的修复没有落盘")
+    if "int main(){return 1;}" in (TMP_WS / "main.cpp").read_text(encoding="utf-8"):
+        bad.append("本地模型写代码竟然落盘了(它不许写代码)")
+    if not any(r.get("action") == "fix-blocked" and (r.get("suggested") or []) for r in res["rounds"]):
+        bad.append("被拦下的改动没有作为'建议'记下来")
     if not any("CMakeLists.txt" in p for p in prompts):
         bad.append("验证提示词里没有项目文件列表")
     if not any(e.get("stage") == "verify" and e.get("action") == "run-done" for e in events):
         bad.append("没有向前端推送验证事件: " + json.dumps(events[:3], ensure_ascii=False)[:300])
+    if not any(e.get("action") == "fix-blocked" for e in events):
+        bad.append("拦住本地模型写代码时没有通知界面")
     if not any(e.get("action") == "finished" for e in events):
         bad.append("验证结束时没有推送 finished 事件(刷新过的页面会一直转圈)")
     st = await server.api_world_state()
     print("world/state:", json.dumps(st, ensure_ascii=False)[:200])
     if not (st.get("verify") or {}).get("action") == "finished" or not st["verify"].get("ok"):
         bad.append("world/state 没有记下最近一次验证结果: " + json.dumps(st, ensure_ascii=False)[:200])
-    if not res.get("changed"):
-        bad.append("没有回报本地模型自己改了哪些文件")
+    if res.get("changed"):
+        bad.append("本地模型没写任何代码, 却报了 changed: " + json.dumps(res.get("changed"), ensure_ascii=False))
 
     # 失败场景: error_log 要能直接发给网页模型(含命令/退出码/输出)
     seq2 = iter([
@@ -108,7 +117,7 @@ async def main() -> int:
     try:
         workspace.use_root(TMP_WS)
         r3 = await server.api_world_verify(server.WorldVerifyRequest(
-            task="修 main", answer="改成 2", max_rounds=2, timeout=20))
+            task="修 main", answer="改成 2", max_rounds=2, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
@@ -136,7 +145,7 @@ async def main() -> int:
     try:
         workspace.use_root(TMP_WS)
         r4 = await server.api_world_verify(server.WorldVerifyRequest(
-            task="x", answer="y", applied=[], max_rounds=3, timeout=20))
+            task="x", answer="y", applied=[], max_rounds=3, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
@@ -156,7 +165,7 @@ async def main() -> int:
     try:
         workspace.use_root(TMP_WS)
         r5 = await server.api_world_verify(server.WorldVerifyRequest(
-            task="x", answer="y", applied=[], max_rounds=1, timeout=20))
+            task="x", answer="y", applied=[], max_rounds=1, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
@@ -180,7 +189,8 @@ async def main() -> int:
     planner.ask = fake_danger
     try:
         workspace.use_root(TMP_WS)
-        r2 = await server.api_world_verify(server.WorldVerifyRequest(task="x", answer="y", max_rounds=2))
+        r2 = await server.api_world_verify(server.WorldVerifyRequest(task="x", answer="y", max_rounds=2,
+                                                                   force=True))
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
@@ -213,7 +223,8 @@ async def main() -> int:
     try:
         workspace.use_root(TMP_WS)
         r6 = await server.api_world_verify(server.WorldVerifyRequest(
-            task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=3, timeout=20))
+            task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=3, timeout=20,
+            force=True))
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
@@ -248,7 +259,8 @@ async def main() -> int:
     try:
         workspace.use_root(TMP_WS)
         r7 = await server.api_world_verify(server.WorldVerifyRequest(
-            task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=3, timeout=20))
+            task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=3, timeout=20,
+            force=True))
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
@@ -281,7 +293,7 @@ async def main() -> int:
     try:
         workspace.use_root(TMP_WS)
         r8 = await server.api_world_verify(server.WorldVerifyRequest(
-            task="x", answer="y", applied=[], max_rounds=2, timeout=20))
+            task="x", answer="y", applied=[], max_rounds=2, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
         server.broadcast = orig_broadcast
@@ -303,7 +315,8 @@ async def main() -> int:
         try:
             workspace.use_root(TMP_WS)
             r = await server.api_world_verify(server.WorldVerifyRequest(
-                task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=rounds, timeout=20))
+                task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=rounds, timeout=20,
+                force=True))
         finally:
             planner.ask = orig_ask
             workspace.use_root(orig_root)
@@ -419,7 +432,8 @@ async def main() -> int:
     planner.ask = fake_ask8
     try:
         workspace.use_root(TMP_WS)
-        await server.api_world_verify(server.WorldVerifyRequest(task="x", answer="y", max_rounds=1, timeout=20))
+        await server.api_world_verify(server.WorldVerifyRequest(task="x", answer="y", max_rounds=1,
+                                                               timeout=20, force=True))
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
@@ -488,7 +502,8 @@ async def main() -> int:
     try:
         workspace.use_root(TMP_WS)
         r9 = await server.api_world_verify(server.WorldVerifyRequest(
-            task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=2, timeout=20))
+            task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=2, timeout=20,
+            force=True))
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
@@ -498,14 +513,17 @@ async def main() -> int:
                                      ensure_ascii=False))
     if len(r9["rounds"]) <= 2:
         bad.append("一次都没动手改, 却没追加自修轮数: " + json.dumps(r9["rounds"], ensure_ascii=False)[:200])
-    if not any("一次都没有动手改" in p for p in prompts9):
-        bad.append("没动手改时提示词里没有逼它自己修")
+    # 追加的轮数现在是"换命令继续找证据", 不许再逼它改代码
+    if not any("换一条能真正跑出证据的命令" in p for p in prompts9):
+        bad.append("没拿出结论时提示词里没有让它换命令找证据")
+    if any("直接用 fix" in p or "必须自己用 fix" in p for p in prompts9):
+        bad.append("提示词还在让本地模型自己用 fix 改代码: " + str([p[-160:] for p in prompts9])[:200])
     if r9.get("local_fixes") or r9.get("tried_local_fix"):
         bad.append("一次都没修过却报了 local_fixes: " + json.dumps(r9, ensure_ascii=False)[:200])
     if r9.get("reason") != "real-error":
         bad.append("有真实报错时原因不对: " + json.dumps(r9.get("reason"), ensure_ascii=False))
 
-    # 本地模型自己修过(但没修好) -> 如实记下修了几次
+    # 本地模型想改代码 -> 拦下来(不落盘), 只如实记下"它想改几次"
     seq10 = iter([
         json.dumps({"action": "run", "command": "cmd /c echo still-bad & exit 1"}),
         json.dumps({"action": "fix", "message": "改了", "files": [
@@ -522,7 +540,7 @@ async def main() -> int:
     try:
         workspace.use_root(TMP_WS)
         r10 = await server.api_world_verify(server.WorldVerifyRequest(
-            task="x", answer="y", applied=[], max_rounds=3, timeout=20))
+            task="x", answer="y", applied=[], max_rounds=3, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
@@ -533,9 +551,11 @@ async def main() -> int:
                                    "changed": [a.get("path") for a in (r10.get("changed") or [])]},
                                   ensure_ascii=False))
     if not r10.get("local_fixes") or not r10.get("tried_local_fix"):
-        bad.append("自己改过却没记下本地修复次数: " + json.dumps(r10, ensure_ascii=False)[:250])
-    if "int main(){return 9;}" not in (TMP_WS / "main.cpp").read_text(encoding="utf-8"):
-        bad.append("本地模型的自修没有落盘")
+        bad.append("它想改代码却没记下次数: " + json.dumps(r10, ensure_ascii=False)[:250])
+    if "int main(){return 9;}" in (TMP_WS / "main.cpp").read_text(encoding="utf-8"):
+        bad.append("本地模型的自修竟然落盘了(它不许写代码)")
+    if not any(r.get("action") == "fix-blocked" for r in r10.get("rounds") or []):
+        bad.append("想改代码的轮次没有被标成 fix-blocked: " + json.dumps(r10.get("rounds"), ensure_ascii=False)[:200])
 
     shutil.rmtree(TMP_WS, ignore_errors=True)
     if bad:
@@ -543,7 +563,7 @@ async def main() -> int:
         for b in bad:
             print(" -", b)
         return 1
-    print("WORLD_VERIFY_OK (按需求定验收点->找证据->自己改; 读文件不算验证, 没证据/没验收点不许 done; "
+    print("WORLD_VERIFY_OK (本地模型只跑命令/看输出, 不写代码; 按需求定验收点->找证据; "
           "证据要点名真跑过的命令+引用真实输出; 编译不算行为证据; 包装命令藏的退出码按失败算; "
           "拿工作区外的旧副本验证会被点破; 每轮验证留痕可复核; 危险命令被拦)")
     return 0

@@ -44,35 +44,34 @@ async def main() -> int:
     TMP_WS.mkdir(parents=True, exist_ok=True)
     (TMP_WS / "EditorArea.qml").write_text("// v1\n", encoding="utf-8")
 
-    # ---------- 后端: 落盘 ----------
+    # ---------- 后端: 落盘 = 从回答里机械整理(本地模型不参与, 更不写代码) ----------
     captured = {}
     orig_ask = planner.ask
     orig_root = workspace.ROOT           # 跑完还原: use_root 不写设置, 别冲掉用户配的工作区
 
     async def fake_ask(cfg, prompt, system=None):
         captured["prompt"] = prompt
-        return json.dumps({"message": "按 ChatGPT 的方案改好了", "files": [
-            {"op": "update", "path": "EditorArea.qml", "content": "// v2 加了滚动条\n"}]},
-            ensure_ascii=False)
+        return json.dumps({"message": "本地模型不该被叫到", "files": []}, ensure_ascii=False)
 
     planner.ask = fake_ask
     try:
         workspace.use_root(TMP_WS)
         res = await server.api_world_apply(server.WorldApplyRequest(
-            task="内容区滚动条隐藏了, 让它显示出来", text="把 EditorArea.qml 改成 ScrollView + ThinScrollBar"))
+            task="内容区滚动条隐藏了, 让它显示出来",
+            text="把 EditorArea.qml 改成这样:\n```qml\n// v2 加了滚动条\n```"))
         body = res if isinstance(res, dict) else json.loads(res.body.decode("utf-8"))
-        print("落盘:", json.dumps(body, ensure_ascii=False))
+        print("落盘:", json.dumps(body, ensure_ascii=False)[:300])
         if not body.get("ok") or not body.get("applied"):
-            bad.append("落盘接口没有应用任何改动: " + json.dumps(body, ensure_ascii=False))
+            bad.append("落盘接口没有应用任何改动: " + json.dumps(body, ensure_ascii=False)[:300])
         if "v2" not in (TMP_WS / "EditorArea.qml").read_text(encoding="utf-8"):
             bad.append("文件没有被写入")
-        if "ChatGPT 的回答" not in captured.get("prompt", "") and "ChatGPT" not in captured.get("prompt", ""):
-            bad.append("落盘提示词里没带上 ChatGPT 的回答")
+        if captured.get("prompt"):
+            bad.append("落盘时调用了本地模型(它不该参与; 更不该由它写代码)")
     finally:
         planner.ask = orig_ask
         workspace.use_root(orig_root)
 
-    # ---------- 后端: 从"说明文字"里认出目标文件, 并把当前内容喂给本地模型 ----------
+    # ---------- 后端: 从"说明文字"里认出目标文件 ----------
     (TMP_WS / "qml" / "components").mkdir(parents=True, exist_ok=True)
     (TMP_WS / "qml" / "components" / "EditorArea.qml").write_text("// 旧内容\nScrollBar.AsNeeded\n", encoding="utf-8")
     (TMP_WS / "Main.qml").write_text("// main\n", encoding="utf-8")
@@ -88,33 +87,32 @@ async def main() -> int:
     finally:
         workspace.use_root(orig_root)
 
-    seen_prompt = {}
+    # ---------- 后端: 内容原样照抄 + 依然不叫本地模型 ----------
+    called_ctx = []
     orig_ask2 = planner.ask
 
     async def fake_ask_ctx(cfg, prompt, system=None):
-        seen_prompt["p"] = prompt
-        return json.dumps({"message": "按说明改好", "files": [
-            {"op": "update", "path": "qml/components/EditorArea.qml",
-             "content": "// 新内容\nScrollBar.AlwaysOn\n"}]}, ensure_ascii=False)
+        called_ctx.append(prompt)
+        return json.dumps({"message": "不该被叫到", "files": []}, ensure_ascii=False)
 
     planner.ask = fake_ask_ctx
     try:
         workspace.use_root(TMP_WS)
         res_ctx = await server.api_world_apply(server.WorldApplyRequest(
-            task="让滚动条常显", text="只需要修改 qml/components/EditorArea.qml, 把 AsNeeded 改成 AlwaysOn"))
+            task="让滚动条常显",
+            text="只需要修改 qml/components/EditorArea.qml:\n```qml\n// 新内容\nScrollBar.AlwaysOn\n```"))
     finally:
         planner.ask = orig_ask2
         workspace.use_root(orig_root)
     res_ctx = res_ctx if isinstance(res_ctx, dict) else json.loads(res_ctx.body.decode("utf-8"))
-    p = seen_prompt.get("p", "")
-    print("提示词含当前内容:", "【当前文件内容: qml/components/EditorArea.qml】" in p,
-          "| 含 AlwaysOn 说明:", "AlwaysOn" in p)
-    if "【当前文件内容: qml/components/EditorArea.qml】" not in p:
-        bad.append("没把目标文件的当前内容给本地模型(它没法给出完整内容)")
-    if "// 旧内容" not in p:
-        bad.append("提示词里没有目标文件的真实内容")
+    got_ctx = (TMP_WS / "qml" / "components" / "EditorArea.qml").read_text(encoding="utf-8")
+    print("原样落盘:", repr(got_ctx), "| 本地模型被调用:", len(called_ctx))
+    if called_ctx:
+        bad.append("整理文件改动时调用了本地模型: " + str(len(called_ctx)))
+    if got_ctx != "// 新内容\nScrollBar.AlwaysOn\n":
+        bad.append("落盘内容与回答里的代码不一致(不该改写): " + repr(got_ctx))
     if not res_ctx.get("applied"):
-        bad.append("这种'说明文字+替换'的回答没有被落实: " + json.dumps(res_ctx, ensure_ascii=False)[:200])
+        bad.append("这种'说明文字+代码块'的回答没有被落实: " + json.dumps(res_ctx, ensure_ascii=False)[:200])
 
     # ---------- 后端: 改动更新不该被误判为"跳过"(老的 tuple.size bug) ----------
     # 注意: 这一段以前漏了切根 —— 于是它直接往**用户配置的工作区**(H:\steward 之类)里
@@ -224,42 +222,53 @@ async def main() -> int:
         if "FILE-CHANGE PROTOCOL" in (sent[0][1] or {}).get("text", ""):
             bad.append("还在发旧的工程协议提示词")
 
-        # 模拟回答回来 -> 应该弹出确认框
+        # 模拟回答回来 -> 消息下面应该出现「识别到的文件改动」卡片(不再弹确认框)
         await page.evaluate(r"""() => {
           handle({ type: "message_start" });
           handle({ type: "delta", kind: "text", text: "把 EditorArea.qml 换成 ScrollView + ThinScrollBar 即可。" });
           handle({ type: "message_end" });
         }""")
         await page.wait_for_timeout(900)
-        dlg = await page.evaluate(r"""() => ({
-          open: document.getElementById("applyOverlay").classList.contains("show"),
-          items: Array.from(document.querySelectorAll("#applyList .apply-item")).map(it => ({
-            op: it.querySelector(".ai-op").textContent,
-            path: it.querySelector(".ai-path").textContent,
-            meta: it.querySelector(".ai-meta").textContent,
-            checked: it.querySelector("input").checked,
-          })),
-          note: document.getElementById("applyNote").textContent,
-          hasVerifyRow: !!document.getElementById("applyVerify"),
-          sendDisabled: document.getElementById("btnSend").disabled,
-          sendTitle: document.getElementById("btnSend").title,
-        })""")
-        print("确认框:", json.dumps(dlg, ensure_ascii=False))
-        file_rows = [i for i in dlg["items"] if i["op"] != "自测"]
-        if not dlg["open"] or len(file_rows) != 2:
-            bad.append("落盘前没有弹出确认框(应含 2 个文件 + 自测步骤): " + json.dumps(dlg, ensure_ascii=False))
+        dlg = await page.evaluate(r"""() => {
+          const card = Array.from(document.querySelectorAll("#conv .task-card"))
+            .find(c => c.querySelector("b").textContent.indexOf("识别到的文件改动") >= 0);
+          return {
+            open: !!card,
+            title: card ? card.querySelector("b").textContent : "",
+            items: card ? Array.from(card.querySelectorAll(".task-item")).map(it => ({
+              op: (it.querySelector(".ti") || {}).textContent || "",
+              text: it.querySelector(".tt").textContent,
+              content: (it.querySelector("details pre") || {}).textContent || "",
+              checked: it.querySelector("input[type=checkbox]").checked,
+            })) : [],
+            buttons: card ? Array.from(card.querySelectorAll(".task-btns button")).map(b => b.textContent) : [],
+            verifyRow: card ? !!card.querySelector(".task-check") : false,
+            overlay: document.getElementById("applyOverlay").classList.contains("show"),
+            sendDisabled: document.getElementById("btnSend").disabled,
+          };
+        }""")
+        print("落盘卡片:", json.dumps(dlg, ensure_ascii=False)[:500])
+        if not dlg["open"] or len(dlg["items"]) != 2:
+            bad.append("消息下面没有列出识别到的 2 个文件改动: " + json.dumps(dlg, ensure_ascii=False)[:300])
         elif not all(i["checked"] for i in dlg["items"]):
-            bad.append("确认框里默认应勾选: " + json.dumps(dlg["items"], ensure_ascii=False))
-        if not dlg["hasVerifyRow"]:
-            bad.append("确认框里没有「自测」这一步: " + json.dumps(dlg, ensure_ascii=False))
+            bad.append("卡片里默认应勾选: " + json.dumps(dlg["items"], ensure_ascii=False))
+        elif not all(i["content"] for i in dlg["items"]):
+            bad.append("卡片上没有文件内容: " + json.dumps(dlg["items"], ensure_ascii=False))
+        if dlg["buttons"] != ["写入选中的", "全部跳过"]:
+            bad.append("卡片按钮不对: " + json.dumps(dlg["buttons"], ensure_ascii=False))
+        if not dlg["verifyRow"]:
+            bad.append("卡片里没有「写入后自测」这一步")
+        if dlg["overlay"]:
+            bad.append("还在弹确认框(应该只在消息下面出卡片)")
         if not dlg["sendDisabled"]:
             bad.append("本地执行期间发送按钮应该置灰")
         # 取消勾选第二个文件 -> 只应写入第一个
         await page.evaluate("""() => {
-          const boxes = document.querySelectorAll("#applyList .apply-item input");
-          boxes[1].checked = false;
+          const card = Array.from(document.querySelectorAll("#conv .task-card"))
+            .find(c => c.querySelector("b").textContent.indexOf("识别到的文件改动") >= 0);
+          card.querySelectorAll(".task-item input[type=checkbox]")[1].checked = false;
+          card.querySelector(".task-btns button.pri").click();
         }""")
-        await page.click("#applyOk")
         await page.wait_for_timeout(1500)
         st = await page.evaluate(r"""() => ({
           cards: Array.from(document.querySelectorAll("#conv .task-card")).map(c => ({
@@ -277,7 +286,7 @@ async def main() -> int:
         if not st["answerShown"]:
             bad.append("ChatGPT 的回答没有作为消息显示")
         titles = [c["title"] for c in st["cards"]]
-        if "本地落盘(本地模型写入工作区)" not in titles or "本地验证(按需求验收点找证据)" not in titles:
+        if not any(t.startswith("本地落盘") for t in titles) or "本地验证(按需求验收点找证据)" not in titles:
             bad.append("缺少落盘/验证卡片: " + json.dumps(titles, ensure_ascii=False))
         else:
             land = [c for c in st["cards"] if c["title"].startswith("本地落盘")][0]
@@ -292,7 +301,7 @@ async def main() -> int:
         commits = await page.evaluate("() => window.__calls.filter(c => c[0] === '/api/world/commit')")
         print("提交:", json.dumps(commits, ensure_ascii=False)[:200])
         if not commits:
-            bad.append("确认框点「应用勾选的」后没有调用 commit")
+            bad.append("卡片点「写入选中的」后没有调用 commit")
         else:
             paths = [f["path"] for f in commits[0][1]["files"]]
             if paths != ["EditorArea.qml"]:
@@ -310,17 +319,19 @@ async def main() -> int:
         if not any("自测报错" in b for b in st["bubbles"]):
             bad.append("消息列表里没有提示已回传报错: " + json.dumps(st["bubbles"], ensure_ascii=False))
 
-        # 场景2: 本地模型没给出改动 -> 说明原因, 但仍然去验证
+        # 场景2: 回答里没认出可写入的文件 -> 不写盘、不弹框、也不去自测(没什么可测的)
         await page.evaluate(r"""() => {
           window.__calls = [];
           showWelcome(false);
           post = async (url, body) => {
             window.__calls.push([url, body]);
             if (url === "/api/chat") return { ok: true };
-            if (url === "/api/world/apply") return { ok: true, dry_run: true, empty: true,
-              message: "这次回答里没有具体代码改动", files: [] };
-            if (url === "/api/world/verify") return { ok: true, gave_up: false, rounds: [
-              { round: 1, action: "done", text: "项目本身能构建通过" }], last_output: "" };
+            if (url === "/api/world/apply") return { ok: true, no_changes: true, empty: true,
+              reason: "回答里有代码, 但没认出这些代码属于哪个文件", loose: 0,
+              text: "这条回答里没有可写入的文件(回答里没有代码, 也没有认出文件改动) —— "
+                    + "已跳过: 没有调用本地模型, 也没有动任何文件",
+              files: [] };
+            if (url === "/api/world/verify") return { ok: true, gave_up: false, rounds: [] };
             return {};
           };
           worldTask = "只看不改的任务";
@@ -329,30 +340,21 @@ async def main() -> int:
           handle({ type: "message_end" });
         }""")
         await page.wait_for_timeout(1200)
-        # 没有文件改动时也会弹确认框(只有自测这一步), 勾着执行 -> 应该去验证
-        dlg2 = await page.evaluate("""() => ({
-          open: document.getElementById("applyOverlay").classList.contains("show"),
-          verifyChecked: (document.getElementById("applyVerify") || {}).checked,
-        })""")
-        if not dlg2["open"]:
-            bad.append("没有文件改动时也应该弹步骤确认框: " + json.dumps(dlg2, ensure_ascii=False))
-        await page.click("#applyOk")
-        await page.wait_for_timeout(1200)
         st2 = await page.evaluate(r"""() => ({
           calls: window.__calls.map(c => c[0]),
+          overlay: document.getElementById("applyOverlay").classList.contains("show"),
           cards: Array.from(document.querySelectorAll("#conv .task-card")).map(c => ({
             title: c.querySelector("b").textContent,
             count: (c.querySelector(".tcount") || {}).textContent || "",
             foot: c.querySelector(".task-foot").textContent })),
         })""")
         print("空清单场景:", json.dumps(st2, ensure_ascii=False)[:400])
-        if "/api/world/verify" not in st2["calls"]:
-            bad.append("本地模型没给出改动时, 也应该去验证项目: " + json.dumps(st2["calls"], ensure_ascii=False))
-        if not any(("没有需要写入的文件" in c["foot"]) or ("没有具体文件改动" in c["foot"])
-                   for c in st2["cards"]):
-            bad.append("没有说明为什么没落盘: " + json.dumps(st2["cards"], ensure_ascii=False))
-        if not any(c["count"] == "通过" for c in st2["cards"]):
-            bad.append("验证卡片没有标通过: " + json.dumps(st2["cards"], ensure_ascii=False))
+        if st2["overlay"]:
+            bad.append("没认出文件时不该弹确认框: " + json.dumps(st2, ensure_ascii=False)[:200])
+        if "/api/world/commit" in st2["calls"] or "/api/world/verify" in st2["calls"]:
+            bad.append("没认出可写入的文件时不该写盘/自测: " + json.dumps(st2["calls"], ensure_ascii=False))
+        if not any("没有可写入的文件" in c["foot"] for c in st2["cards"]):
+            bad.append("没有说明为什么没写入: " + json.dumps(st2["cards"], ensure_ascii=False))
 
         # 实时事件(真实环境由 WebSocket 推送): 验证卡片逐行长出来
         await page.evaluate(r"""() => {
@@ -391,7 +393,11 @@ async def main() -> int:
           handle({ type: "message_end" });
         }""")
         await page.wait_for_timeout(900)
-        await page.click("#applyOk")
+        await page.evaluate("""() => {
+          const card = Array.from(document.querySelectorAll("#conv .task-card"))
+            .reverse().find(c => c.querySelector(".task-btns button.pri"));
+          card.querySelector(".task-btns button.pri").click();
+        }""")
         await page.wait_for_timeout(1200)
         st3 = await page.evaluate(r"""() => ({
           calls: window.__calls.map(c => c[0]),
@@ -430,7 +436,11 @@ async def main() -> int:
           window.__restoreReply = () => { replyChoice = keep; };
         }""")
         await page.wait_for_timeout(900)
-        await page.click("#applyOk")
+        await page.evaluate("""() => {
+          const card = Array.from(document.querySelectorAll("#conv .task-card"))
+            .reverse().find(c => c.querySelector(".task-btns button.pri"));
+          card.querySelector(".task-btns button.pri").click();
+        }""")
         await page.wait_for_timeout(1200)
         st4 = await page.evaluate(r"""() => {
           window.__restoreReply();

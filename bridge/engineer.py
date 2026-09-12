@@ -31,11 +31,15 @@ _OP_EN = {"create": "create", "new": "create", "add": "create",
 
 
 def _parse_loose(text: str):
-    """兜底: 解析 '操作 路径 内容' 的表格/列表(模型不按协议时的退路)。"""
+    """兜底: 解析 '操作 路径 内容' 的表格/列表(模型不按协议时的退路)。
+
+    只认**看着像文件路径**的路径列, 而且不带内容的"新建/修改"行一律不算 —— 因为
+    以前任何以"删除/remove"开头的行都算一条文件改动, 于是代码里的 `remove(id: number) {`
+    和表格里孤零零一个"删除"单元格都变成了"删除某个文件(路径为空)", 这些假清单又把
+    真正的代码围栏整个挤掉: 97k 字的回答里 30 个文件一个都没认出来(踩过)。
+    """
     ops = []
     lines = (text or "").replace("\r\n", "\n").split("\n")
-    cur: dict | None = None
-    seen_header = False
     for line in lines:
         s = line.strip()
         if not s:
@@ -45,35 +49,45 @@ def _parse_loose(text: str):
             continue
         head = cells[0].lower()
         if head in ("操作", "文件路径", "内容", "action", "path", "op", "type"):
-            seen_header = True
             continue
         op = None
         for k, v in {**_OP_ZH, **_OP_EN}.items():
             if head.startswith(k):
                 op = v
                 break
-        if op:
-            if cur and cur.get("path") and "content" not in cur:
-                cur["content"] = ""
-                ops.append(cur)
-            path = cells[1] if len(cells) > 1 else ""
-            path = path.strip("`").strip()
-            cur = {"op": op, "path": path}
-            if len(cells) > 2:
-                cur["content"] = cells[2]
-            if cur.get("op") == "delete":
-                ops.append(cur)
-                cur = None
-    if cur and cur.get("path") and cur.get("op") != "delete":
-        cur.setdefault("content", "")
-        ops.append(cur)
+        if not op or len(cells) < 2:
+            continue
+        path = cells[1].strip("`").strip()
+        content = cells[2] if len(cells) > 2 else ""
+        if not _looks_like_path(path):
+            continue
+        if op != "delete" and not content.strip():
+            continue          # 表格里没带内容 -> 内容在代码围栏里, 不该由这一行来写
+        ops.append({"op": op, "path": path, "content": content})
     if ops:
         return {"message": "loose-parse", "files": ops}
     return None
 
 
+def _has_file_entries(obj) -> bool:
+    """这是不是一份**可用的**变更清单?
+
+    放宽的两点(都必须保留, 否则工程流程会走错):
+      * `{"files": []}` 算清单 —— 它是模型在说"没有改动", 上层靠它决定要不要催它重答;
+      * 条目是对象时至少得有一个带 path 的, 光有 `"files": ["dist"]`(package.json 的字段)
+        不算清单, 否则真代码围栏会被它顶掉(踩过: 97k 字的回答 30 个文件全没认出来)。
+    """
+    files = obj.get("files") if isinstance(obj, dict) else None
+    if not isinstance(files, list):
+        return False
+    if not files:
+        return True
+    return any(isinstance(f, dict) and str(f.get("path") or "").strip() for f in files)
+
+
 def extract_manifest(text: str):
     """返回 (obj, source)。从回答里提取变更清单; 找不到返回 (None, reason)。"""
+    text = strip_fence_labels(text)
     candidates = []
     for m in _MANIFEST_RE.finditer(text or ""):
         candidates.append(m.group(1))
@@ -83,7 +97,7 @@ def extract_manifest(text: str):
             obj = json.loads(cand)
         except Exception:
             continue
-        if isinstance(obj, dict) and isinstance(obj.get("files"), list):
+        if _has_file_entries(obj):
             return obj, "json-fence"
     # 兜底: 从任意 '{' 开始 raw_decode(能容忍 JSON 前后混有其它文字/围栏缺失)
     dec = json.JSONDecoder()
@@ -95,9 +109,12 @@ def extract_manifest(text: str):
             obj, _ = dec.raw_decode(text[i:])
         except Exception:
             continue
-        if isinstance(obj, dict) and isinstance(obj.get("files"), list):
+        if _has_file_entries(obj):
             return obj, "raw-object"
-    loose = _parse_loose(text)
+    # 表格兜底只在**围栏之外**的正文里找: 代码块里的 `remove(id) {`、表格里一个"删除"单元格
+    # 都不是变更清单(否则会把真正的代码围栏挤掉)。
+    prose = re.sub(r"```.*?```", "\n", text, flags=re.S)
+    loose = _parse_loose(prose)
     if loose:
         return loose, "loose-table"
     return None, "未找到含 files 数组的 JSON 清单"
@@ -428,7 +445,241 @@ def repair_prompt(original: str, err: str, raw_snip: str) -> str:
     )
 
 
-_PATH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.(?:qml|js|ts|tsx|jsx|py|cpp|cc|cxx|h|hpp|java|kt|go|rs|rb|php|cs|swift|m|mm|sql|json|ya?ml|toml|ini|cmake|txt|md|html|css|scss|sh|ps1|bat|xml|lua|pro|pri)")
+# 扩展名表: **长的必须排在它自己的前缀前面**(html 在 h 前、json 在 js 前; vue 别漏) ——
+# 否则 "index.html" 会被匹配成 "index.h", "src/App.vue" 直接认不出来(踩过)。
+_PATH_EXTS = ("cmake", "scss", "hpp", "json", "jsx", "tsx", "cpp", "cxx", "html", "swift",
+              "svelte", "astro", "prisma", "gradle", "qml", "toml", "yaml", "yml", "java",
+              "php", "txt", "css", "vue", "ts", "js", "cc", "mm", "md", "py", "kt", "kts",
+              "go", "rs", "rb", "cs", "h", "m", "c", "sql", "ini", "sh", "ps1", "bat",
+              "xml", "lua", "pro", "pri")
+_PATH_RE = re.compile(r"[A-Za-z0-9_./\\-]+\.(?:" + "|".join(_PATH_EXTS) + ")")
+
+
+# 代码围栏: ```lang\n...\n```
+_FENCE_RE = re.compile(r"```[ \t]*([^\n`]*)\n(.*?)(?:```|\Z)", re.S)
+_COMMENT_HEADS = ("#", "//", "/*", "*", "<!--", "--", ";", "%")
+
+# 站点有时把语言名渲染成**围栏正文的第一行**:
+#     ```
+#     JSON
+#     { "name": "..." }
+#     ```
+# 原样落盘的话每个文件第一行都会多出 "JSON"/"HTML"/"TypeScript", package.json 直接不是合法
+# JSON(踩过: 写进去的工程全废)。只认这些"孤零零一个语言名"的行, 别的一个字不动。
+_LANG_LABELS = {
+    "json", "jsonc", "html", "htm", "xml", "css", "scss", "sass", "less", "stylus",
+    "typescript", "ts", "tsx", "javascript", "js", "jsx", "mjs", "cjs", "vue", "svelte",
+    "astro", "python", "py", "java", "kotlin", "kt", "kts", "go", "golang", "rust", "rs",
+    "c", "cpp", "c++", "cxx", "csharp", "cs", "php", "ruby", "rb", "swift", "lua", "sql",
+    "yaml", "yml", "toml", "ini", "conf", "cfg", "sh", "bash", "zsh", "shell", "powershell",
+    "ps1", "bat", "cmd", "dockerfile", "makefile", "markdown", "md", "text", "txt",
+    "plaintext", "plain", "console", "log", "http", "graphql", "gql", "prisma", "gradle",
+    "qml", "pro", "pri", "diff", "patch", "csv", "env", "nginx", "sass", "wasm", "asm",
+}
+
+_FENCE_HEAD_RE = re.compile(r"```[ \t]*[^\n`]*\n[ \t]*([A-Za-z][A-Za-z0-9+#._-]{0,19})[ \t]*\n")
+
+
+def strip_fence_labels(text: str) -> str:
+    """去掉围栏正文第一行那个"孤零零的语言名"(站点渲染成这样, 不是文件内容)。"""
+    def repl(m):
+        label = m.group(1).lower().rstrip(":：")
+        return "```\n" if label in _LANG_LABELS else m.group(0)
+    return _FENCE_HEAD_RE.sub(repl, text or "")
+
+
+def _resolve_any(raw: str, tree_set: set, base: dict) -> str:
+    """把一段文本里抠出来的路径对齐到工作区; 对不上就按"新文件"原样收下(仅限看着像文件名的)。"""
+    tokens = str(raw or "").strip().strip("`*\"'()[]<>").replace("\\", "/").split()
+    if not tokens:
+        return ""
+    cand = tokens[0].lstrip("./")
+    if not cand:
+        return ""
+    if cand in tree_set:
+        return cand
+    hit = base.get(cand.split("/")[-1])
+    if hit:
+        return hit
+    return cand if _PATH_RE.fullmatch(cand) else ""
+
+
+def _looks_like_path(p: str) -> bool:
+    """这个字符串是不是一个"像文件"的路径(必须带已知扩展名, 不能是绝对路径/上跳路径)。"""
+    p = (p or "").strip().strip("`*\"'")
+    if not p or len(p) > 300:
+        return False
+    p = p.replace("\\", "/")
+    if p.startswith("./") or p.startswith("../") or p.startswith("/") or re.match(r"^[A-Za-z]:", p):
+        return False
+    return bool(_PATH_RE.fullmatch(p))
+
+
+def _path_from_info(info: str) -> str:
+    """围栏的信息串里找文件名: ```python main.py / ```main.py / ```py title=src/a.py"""
+    low = (info or "").lower()
+    for key in ("title=", "filename=", "file=", "path=", "name="):
+        i = low.find(key)
+        if i >= 0:
+            m = _PATH_RE.search(info[i + len(key):])
+            if m:
+                return m.group(0)
+    m = _PATH_RE.search(info or "")
+    return m.group(0) if m else ""
+
+
+def _is_manifest_block(body: str) -> bool:
+    """这段围栏本身是不是"变更清单 JSON"(而不是某个文件的代码)?
+
+    只看**形状**: files 是数组, 且条目是对象。这样 package.json 里的 `"files": ["dist"]` 仍然
+    算文件内容(它确实是那个文件), `{"files":[{"op":"delete","path":""}]}` 不会被评为"一段没认出
+    文件名的代码"; 而 **tsconfig.json 里的 `"files": []` 必须当成文件内容**, 不能当成清单
+    (踩过: 那一版 tsconfig.json 整个没写进去)。
+    """
+    t = (body or "").strip()
+    if not t.startswith("{"):
+        return False
+    try:
+        obj = json.loads(t)
+    except Exception:
+        return False
+    files = obj.get("files") if isinstance(obj, dict) else None
+    return isinstance(files, list) and any(isinstance(f, dict) for f in files)
+
+
+def _dedupe_items(items: list[dict]) -> list[dict]:
+    """同一路径出现多次: 留最后一次(通常是改过之后的完整版本), 顺序按首次出现。"""
+    out: dict = {}
+    order: list = []
+    for it in items:
+        p = it.get("path") or ""
+        if not p:
+            continue
+        if p not in out:
+            order.append(p)
+        out[p] = it
+    return [out[p] for p in order]
+
+
+_CREATE_WORDS = ("新建", "创建", "新增", "添加", "create", "add ", "new file")
+
+# 围栏前那几行里"在说某个文件"的说法: 工作区里没有这个路径时, 只有跟着这些词才认它
+# (不然"我建议你用 Qt 的 ScrollView"这种句子里的词就会被误当成文件名)
+_FILE_TALK_WORDS = _CREATE_WORDS + (
+    "修改", "更新", "替换", "删除", "改成", "改为", "写入", "重写", "补上", "改一下",
+    "文件", "路径", "file", "path", "update", "modify", "change", "replace", "delete",
+    "rewrite", "patch", "fix")
+
+
+def _looks_like_name_line(ln: str, path: str) -> bool:
+    """这一行是不是"就写了这一个文件名"(标题/加粗/项目符号/编号/行尾冒号)?
+
+    网页模型的回答几乎都这么写, 所以这条规则很值钱:
+        ### 1. `package.json`      **src/App.vue**      - src/api/request.ts:
+    但一行里还夹着别的说明就不算(例如"### 使用 package.json 里的配置")。
+    """
+    head = re.sub(r"^[\s>#*\-•·]+", "", (ln or "").strip())     # 标题/项目符号
+    head = re.sub(r"^\d+[.、)]\s*", "", head)                    # 编号
+    head = head.strip().strip("`*_'\"")
+    head = head.rstrip(":：").strip()
+    if len(head) > 120:
+        return False
+    head = head.replace("`", "").replace("*", "").strip()
+    if not path or not head.endswith(path):
+        return False
+    rest = head[: -len(path)].strip(" :：,，-—()（）[]【】")
+    return rest in ("", "文件", "file", "文件名", "路径", "path", "new file")
+
+
+def _nearby_path(before: str, tree_set: set, base: dict) -> str:
+    """围栏**前面几行**里提到的文件: 工作区里真实存在的优先;
+
+    不存在的路径只有在"这行确实在说某个文件"时才认(否则宁可不猜)。三种认法:
+      1. 路径就在工作区里(最可信);
+      2. 同行有"修改/新建/文件/path"这类说法;
+      3. 这一行**就是在写一个文件名**(标题行/加粗/编号: `### 8. src/App.vue`)。
+    只看叶子行, 而且调用方已经把其它代码围栏从这段文字里剔掉了 —— 否则上一段围栏信息串里的
+    文件名会被这一段"抢"走。
+    """
+    lines = [ln for ln in (before or "").splitlines() if ln.strip()]
+    for ln in reversed(lines[-6:]):
+        cands = [c for c in (_resolve_any(t, tree_set, base) for t in _PATH_RE.findall(ln)) if c]
+        if not cands:
+            continue
+        intree = [c for c in cands if c in tree_set]
+        if intree:
+            return intree[-1]
+        if any(w in ln.lower() for w in _FILE_TALK_WORDS):
+            return cands[-1]
+        named = [c for c in cands if _looks_like_name_line(ln, c)]
+        if named:
+            return named[-1]
+    return ""
+
+
+def extract_code_files(answer: str, tree_lines: list[str]) -> tuple[list[dict], int]:
+    """从网页模型的回答里**机械地**抽出"要写哪个文件、内容是什么" —— 不经过任何模型。
+
+    这是"本地模型不写代码"的关键: 只做整理/对号入座, 内容**原样照抄**回答里的代码,
+    一个字都不改、不补、不猜。写不写由用户在卡片上勾选。
+
+    返回 (items, loose):
+        items: [{"op": "update|create|delete", "path": ..., "content": ..., "source": ...}]
+        loose: 有几段代码**没认出文件名**(不猜, 让用户/网页模型写明文件名)
+
+    认文件名的顺序:
+        1. 回答里直接给了变更清单 ```json {"files":[...]}``` -> 用它(网页模型自己写的协议)
+        2. 代码围栏的信息串里带路径(```python main.py)
+        3. 围栏里第一行注释带路径(# main.py / // main.cpp)
+        4. 围栏**前面 6 行**里提到的、工作区里真实存在的路径
+    """
+    a = strip_fence_labels(answer or "")      # 去掉"围栏第一行的语言名", 免得它变成文件第一行
+    tree_set = set(tree_lines or [])
+    base = {p.split("/")[-1]: p for p in tree_set}
+
+    obj, _src = extract_manifest(a)
+    if obj and (obj.get("files") or []):          # 网页模型自己给了清单 -> 直接用
+        items: list[dict] = []
+        for it in obj["files"]:
+            if not isinstance(it, dict):
+                continue
+            p = _resolve_any(str(it.get("path") or ""), tree_set, base)
+            if not p:
+                continue
+            op = str(it.get("op") or "").lower()
+            items.append({"op": op if op in ("create", "update", "delete") else "update",
+                          "path": p,
+                          "content": it.get("content") if isinstance(it.get("content"), str) else "",
+                          "force": bool(it.get("force")), "source": "manifest"})
+        if items:
+            return _dedupe_items(items), 0
+        # 清单里一条都没对上(路径全是空的/对不上工作区) -> 不拿它当结论, 继续按代码围栏认文件名
+        log.info("清单解析出来 %d 条但一条都没对上工作区, 改按代码围栏整理", len(obj["files"]))
+
+    items, loose = [], 0
+    matches = list(_FENCE_RE.finditer(a))
+    prev_end = 0
+    for m in matches:
+        prose_before = a[prev_end:m.start()]          # 两段围栏之间的正文(不含围栏自身)
+        prev_end = m.end()
+        info, body = (m.group(1) or "").strip(), m.group(2) or ""
+        if not body.strip():
+            continue
+        if _is_manifest_block(body):
+            continue              # 清单本身不是"某个文件的代码", 也别算成没认出文件名的代码块
+        path = _resolve_any(_path_from_info(info), tree_set, base)
+        if not path:
+            first = body.strip().splitlines()[0] if body.strip() else ""
+            if first.lstrip().startswith(_COMMENT_HEADS):
+                path = _resolve_any(first, tree_set, base)
+        if not path:
+            path = _nearby_path(prose_before, tree_set, base)
+        if not path:
+            loose += 1                            # 认不出就不猜
+            continue
+        items.append({"op": "update" if path in tree_set else "create", "path": path,
+                      "content": body.rstrip("\n") + "\n", "source": "fence"})
+    return _dedupe_items(items), loose
 
 
 def guess_paths(answer: str, tree_lines: list[str], limit: int = 6) -> list[str]:
@@ -444,36 +695,6 @@ def guess_paths(answer: str, tree_lines: list[str], limit: int = 6) -> list[str]
         if len(out) >= limit:
             break
     return out
-
-
-def apply_prompt(task: str, answer: str, tree_lines: list[str], repo: str = "",
-                 file_contents: list[tuple[str, str]] | None = None) -> str:
-    """World 模式新流程: 把网页模型的回答交给本地模型, 让它写成工作区文件改动。"""
-    return (
-        "你是本地工程助手。下面是用户的需求和 ChatGPT 给出的方案/代码。\n"
-        "请把这个方案**落实成对本地工作区文件的改动**, 只输出一个 json 代码块:\n"
-        '{"message": "一句话说明", "files": [\n'
-        '  {"op": "create", "path": "相对路径", "content": "完整文件内容"},\n'
-        '  {"op": "update", "path": "相对路径", "content": "替换后的完整内容"},\n'
-        '  {"op": "delete", "path": "相对路径"}\n'
-        "]}\n"
-        "规则: create/update 必须给出**完整**文件内容(整文件替换), 不要省略已有代码; "
-        "路径必须是工作区内的相对路径; 方案里没有提到的文件不要动; 代码块之外不要输出任何文字。\n"
-        "**不要空手而归**: 即便 ChatGPT 的回答比较概括, 也要自己打开相关文件、判断该改哪些地方, "
-        "把改动写出来(代码块里的代码请原样落进文件); 只有在你确认项目已经是对的、完全不需要改时才回 files: []。\n"
-        "**回答里常见这类说法, 都要当成明确的改动指令**: 「修改文件: xxx」「只需要改 xxx.qml」"
-        "「把 A 段替换成 B」「改成 …」「建议这样写」——出现的路径就是目标文件, 你要把它的**整份新内容**给出来。\n"
-        "**必须基于当前内容改**: 下面给了目标文件的当前内容(如果有), 你的 content 要在它基础上改, "
-        "只替换需要变的部分, 其余原样保留, 不要凭空重写、不要省略已有代码。\n"
-        "**别让用户误会代码是谁写的**: 如果 ChatGPT 的回答里**没有给出代码**(只是说明/思路), "
-        "message 里必须写明「ChatGPT 的回答里没有代码, 以下改动由我(本地模型)按方案编写」。\n" +
-        ("".join("\n\n【当前文件内容: " + p + "】\n" + (c or "")[:24000]
-                 for p, c in (file_contents or [])) or "\n\n(这一步没有附带文件当前内容)")
-        + repo_line(repo) +
-        "\n\n【用户需求】\n" + (task or "(略)")[:4000] +
-        "\n\n【ChatGPT 的回答】\n" + (answer or "")[:24000] +
-        "\n\n【当前工作区文件】\n" + "\n".join(tree_lines[:400] or ["(空)"])
-    )
 
 
 def checks_text(checks) -> str:
@@ -511,11 +732,11 @@ def verify_prompt(task: str, applied: str, tree_lines: list[str], last_cmd: str,
         "不要把读文件当成一轮的成果。\n"
         "\n【3. 每轮只做一件事】\n"
         "- run: 跑一条命令, 并用 verifies 说明它在验哪几条验收点(如 [1,2])。\n"
-        "- fix: 命令失败了先自查 —— 是不是命令在这台机器上用不了、路径写错、语法写错? 是的话换一条 Windows 命令重试(run); "
-        "如果命令没问题、输出确实是改动本身不对, 你就**必须自己用 fix 把它改对**(给出完整文件内容), "
-        "不要只换命令重跑、也不要只写解释: 这一层本来就是你该自己解决的。\n"
         "- done: **只有拿到证据才能用** —— evidence 必须写清: 哪条验收点、**这次真跑过的**那条命令、"
         "以及输出里的**原文片段**(照抄, 不要改写/不要凭印象写); 推荐用列表形式逐条给。\n"
+        "**你不能改代码**(本地模型只负责跑命令、看输出、报结论): 命令失败时先自查是不是命令/路径/语法"
+        "写错了(换一条 Windows 命令重试 run); 确认是代码本身的问题时, 用 done 把「问题在哪个文件的"
+        "什么位置、要怎么改」说清楚, 让用户决定 —— 不要给出 files 去改文件, 服务端也会拦住。"
         "【4. 证据的三条硬要求(达不到就当没验过)】\n"
         "a) 证据只能引用**这次真的跑过、并且退出码为 0** 的命令与输出; 不许拿别处的构建、别的目录/别的副本"
         "(比如项目的旧快照)当证据, 也不许把\"应该没问题\"写成证据。\n"
@@ -528,10 +749,9 @@ def verify_prompt(task: str, applied: str, tree_lines: list[str], last_cmd: str,
         f"(第 {round_no}/{max_rounds} 轮)" + repo_line(repo) +
         "\n\n只输出一个 json 代码块:\n"
         '{"checks": [{"id": 1, "expect": "输入/操作 → 期望结果", "how": "打算怎么验"}], '
-        '"action": "run|fix|done", "command": "要执行的命令(run 时必填)", "verifies": [1], '
+        '"action": "run|done", "command": "要执行的命令(run 时必填)", "verifies": [1], '
         '"evidence": [{"check": 1, "command": "这次跑过的命令", "quote": "输出里的一行原文"}], '
-        '"reason": "一句话理由", "message": "一句话说明", '
-        '"files": [{"op":"create|update|delete","path":"相对路径","content":"完整内容"}]}\n'
+        '"reason": "一句话理由", "message": "一句话说明"}\n'
         "规则: 命令必须是在项目目录下可执行的构建/测试/运行命令, 不要做删除、推送、安装系统之类的事。\n"
         + (("\n【已定验收点(沿用它)】\n" + criteria) if criteria else "") +
         (("\n\n【项目约定的验证命令(合适就优先用它, 不合适就自己挑)】\n" + preferred_cmd.strip())
@@ -578,13 +798,6 @@ def extract_verify(text: str):
             o["action"] = str(o["action"]).strip().lower()
             return o
     return None
-
-
-EMPTY_MANIFEST_NUDGE = (
-    "你上一条回复没有给出任何文件改动(files 是空的)。请打开工作区里的相关文件, "
-    "按上面的需求/方案真正把改动写出来: 仍然只输出一个 json 代码块, files 里给出 {op,path,content}, "
-    "content 必须是**完整**文件内容。只有在你确认确实不需要改动任何文件时, 才回 files: [] 并在 message 里说明原因。"
-)
 
 
 def summary_prompt(ops_summary: str) -> str:
