@@ -21,7 +21,21 @@ sys.stdout.reconfigure(encoding="utf-8")
 from bridge import transcript  # noqa: E402
 
 TMP = ROOT_DIR / ".tmp" / "excerpt-check"
-REAL = ROOT_DIR / "transcripts" / "chatgpt" / "6a97137f-1db8-83ea-a8c8-1eb599c3166f.jsonl"
+# 真实落盘的那份对话: 不在仓库里写死会话 id(那是你账号下的真实会话号), 运行时从目录里挑
+# 一条**确实含这两个字段名**的 —— 挑不到就明确跳过, 不拿一条不相干的对话去断言"捞回来了"。
+NEEDLES = ("Persistence-M", "Bus-Id")
+
+
+def real_corpus():
+    d = ROOT_DIR / "transcripts" / "chatgpt"
+    for p in sorted(d.glob("*.jsonl"), key=lambda q: q.stat().st_size, reverse=True):
+        try:
+            txt = p.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        if all(n in txt for n in NEEDLES):
+            return p
+    return None
 
 # 一条特别长的无关消息(下标 6), 专门用来骗"按长度挑"的实现
 NOISE = "通用讨论。" * 2600
@@ -90,12 +104,13 @@ async def main() -> int:
     if [g["msg_id"] for g in got4] != ["m6", "m7"]:
         bad.append("空任务时应退回最后两条: %s" % [g["msg_id"] for g in got4])
 
-    # 6) 真实数据(如果这台机器上有): 表格里那些低频字段名捞不捞得回来
-    if REAL.exists():
+    # 6) 真实数据(这台机器上有就量, 没有就明确跳过): 表格里那些低频字段名捞不捞得回来
+    real = real_corpus()
+    if real:
         transcript.ROOT = ROOT_DIR / "transcripts"
         transcript._seen.clear()
-        real_conv = REAL.stem
-        rows = [json.loads(l) for l in REAL.open(encoding="utf-8") if l.strip()]
+        real_conv = real.stem
+        rows = [json.loads(l) for l in real.open(encoding="utf-8") if l.strip()]
         rq = "接着排查显卡状态, 需要 nvidia-smi 那张表里 Persistence-M 和 Bus-Id 的原始输出"
         rgot = transcript.excerpt_for("chatgpt", real_conv, rq, budget=12000, max_items=6)
         rt = texts(rgot)
@@ -106,7 +121,8 @@ async def main() -> int:
         longest = max(len(r["text"]) for r in rows)
         print("   (全场最长一条 %d 字; 捞回的占 %d 字)" % (longest, len(rt)))
     else:
-        print("5) 跳过: 没找到真实落盘的对话 %s —— 这条是本次最有说服力的证据, 别忽略" % REAL)
+        print("5) 跳过: transcripts/chatgpt 里没有同时含 %s 的真实对话 —— "
+              "这条是本次最有说服力的证据, 别忽略" % "/".join(NEEDLES))
 
     if bad:
         print("FAIL:")
