@@ -779,26 +779,39 @@ function closeRowMenu() {
   const m = $("rowMenu");
   if (m) m.classList.remove("open");
 }
-function openRowMenu(anchor, actions) {
+function openRowMenu(anchor, actions, opts) {
   const m = $("rowMenu");
   if (!m) return;
+  const o = opts || {};
+  if (m.dataset.cls) m.classList.remove(m.dataset.cls);   // 上一次的修饰类别要清掉
+  m.dataset.cls = o.cls || "";
+  if (o.cls) m.classList.add(o.cls);
+  m.style.minWidth = "";
   m.innerHTML = "";
   (actions || []).forEach(a => {
     const b = document.createElement("button");
     b.type = "button";
-    b.className = "picker-item" + (a.danger ? " danger" : "");
+    b.className = "picker-item" + (a.danger ? " danger" : "") + (a.on ? " active" : "");
     const nm = document.createElement("span");
     nm.className = "nm";
     nm.textContent = a.label;
     b.appendChild(nm);
+    if (a.on) {                                   // 当前选中那一项: 灰底 + 勾(和站点选择器同一套)
+      const tk = document.createElement("span");
+      tk.className = "tick";
+      tk.textContent = "✓";
+      b.appendChild(tk);
+    }
     b.onclick = (ev) => { ev.stopPropagation(); closeRowMenu(); a.run(); };
     m.appendChild(b);
   });
   m.classList.add("open");
   const r = anchor.getBoundingClientRect();
+  if (o.matchWidth) m.style.minWidth = Math.round(r.width) + "px";   // 先定宽, 再量菜单自身
   const mw = m.offsetWidth, mh = m.offsetHeight;
-  let left = Math.max(8, Math.min(r.right - mw, window.innerWidth - mw - 8));
+  let left = (o.align === "left" ? r.left : r.right - mw);
   let top = r.bottom + 4;
+  left = Math.max(8, Math.min(left, window.innerWidth - mw - 8));
   if (top + mh > window.innerHeight - 8) top = Math.max(8, r.top - mh - 4);
   m.style.left = Math.round(left) + "px";
   m.style.top = Math.round(top) + "px";
@@ -3456,6 +3469,27 @@ function syncSetType() {
   if (t === "local" && !$("setBase").value.trim()) $("setBase").value = "http://127.0.0.1:8080/v1";
   if (t === "local" && !$("setModel").value.trim()) $("setModel").value = "local-model";
   $("setClearKey").style.display = t === "api" && window.__hasKey ? "" : "none";
+  renderTypePick();
+}
+/* 「规划模型类型」自己画: 原生 select 展开那一片是操作系统画的(字号、行距、高亮、勾选都不归我们)。
+   菜单复用侧栏行菜单那套(.rowmenu + .picker-item, fixed 定位所以不会被设置面板的滚动区裁掉);
+   选择结果照样写回那个隐藏 select 并派 change, 所以读 .value 的 6 处代码一行都不用动。 */
+function renderTypePick() {
+  const b = $("setTypeBtn"), sel = $("setType");
+  if (!b || !sel) return;
+  const op = sel.options[sel.selectedIndex] || sel.options[0];
+  b.querySelector(".pick-t").textContent = op ? op.textContent : "";
+}
+function openTypeMenu() {
+  const sel = $("setType");
+  openRowMenu($("setTypeBtn"), Array.from(sel.options).map(op => ({
+    label: op.textContent, on: op.value === sel.value,
+    run: () => {
+      if (sel.value === op.value) return;
+      sel.value = op.value;
+      sel.dispatchEvent(new Event("change"));     // 走原来的 onchange = syncSetType
+    },
+  })), { align: "left", matchWidth: true, cls: "pick" });
 }
 async function openSettings() {
   try {
@@ -3509,6 +3543,7 @@ $("setDetect").onclick = async () => {
 };
 $("setClose").onclick = () => setOverlay.classList.remove("show");
 $("setType").onchange = syncSetType;
+$("setTypeBtn").onclick = (ev) => { ev.stopPropagation(); openTypeMenu(); };
 /* 设置面板里的一句话说明: 现在真正生效的是哪个模型(全局设置, 所有会话/窗口共用) */
 function plannerSummary(s) {
   const p = (s && s.planner) || {};

@@ -79,6 +79,10 @@ html:not(.has-workspace) .history{max-height:none}
 /* 会话行的"更多"浮层(置顶/删除, 均为本地操作) */
 .rowmenu{position:fixed;display:none;z-index:90;min-width:132px;padding:4px;background:#fff;border-radius:12px;box-shadow:0 10px 34px rgba(24,27,33,.18),0 2px 8px rgba(24,27,33,.06)}
 .rowmenu.open{display:block}
+/* 选项式菜单(设置里的「规划模型类型」): 上下间距照站点选择器那一套 —— .picker 是
+   padding:6px + gap:4px, 这里用同一对数, 不另发明数。只加在这个修饰类上, 侧栏那个行菜单不变。 */
+.rowmenu.pick{padding:6px}
+.rowmenu.pick.open{display:flex;flex-direction:column;gap:4px}
 .rowmenu .picker-item{font-size:14px;line-height:20px;min-height:34px}
 .rowmenu .picker-item.danger{color:var(--red)}
 .rowmenu .picker-item.danger:hover{background:#FDF1F1}
@@ -385,8 +389,15 @@ img.md-img{display:block;max-width:min(420px,100%);max-height:300px;object-fit:c
 .editor-path{color:var(--accent);word-break:break-all}
 .set-row{display:flex;flex-direction:column;gap:4px}
 .set-row label{font-size:12px;line-height:16px;color:var(--sub)}
-.set-row input,.set-row select{padding:7px 10px;border:1px solid var(--line2);border-radius:8px;font:inherit;font-size:14px;line-height:20px;outline:none;color:var(--text);background:#fff}
+.set-row input,.set-row select,.set-row .pick{padding:7px 10px;border:1px solid var(--line2);border-radius:8px;font:inherit;font-size:14px;line-height:20px;outline:none;color:var(--text);background:#fff}
 .set-row input:focus,.set-row select:focus{border-color:var(--accent)}
+/* 自绘的"规划模型类型"下拉(原生 select 只留作状态容器, 代码里读它的 .value)。
+   外框和上面那条规则同一份声明, 所以高度/圆角/字号和旁边的输入框完全一致。 */
+.set-row .pick{display:flex;align-items:center;gap:8px;width:100%;text-align:left;cursor:pointer}
+.set-row .pick:focus-visible{border-color:var(--accent)}
+.set-row .pick:hover{border-color:var(--muted)}      /* 悬停只换边框色, 不改尺寸 */
+.set-row .pick .pick-t{flex:1;min-width:0;white-space:normal;overflow-wrap:anywhere}
+.set-row .pick .caret{flex:0 0 auto;color:var(--muted);font-size:12px;line-height:16px}
 #setDetect{margin-top:6px;padding:6px 12px;border:1px solid var(--line2);border-radius:8px;background:#fff;font-size:14px;line-height:20px;cursor:pointer;color:var(--text);text-align:left}
 #setDetect:hover{background:var(--bubble)}
 #setResult{font-size:14px;line-height:20px;color:var(--sub);white-space:pre-wrap;max-height:80px;overflow:auto}

@@ -80,7 +80,7 @@ python main.py
 
 ## 跑自检
 
-`tests/` 下 80 个 `*_check.py` / `*_test.py`，一条命令扫一遍：
+`tests/` 下 81 个 `*_check.py` / `*_test.py`，一条命令扫一遍：
 
 ```bash
 for t in tests/*_check.py tests/*_test.py; do

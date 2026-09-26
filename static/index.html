@@ -182,12 +182,15 @@
         选「网页当前 Provider」时只能做规划/摘要, 不能落盘。World 模式的规划模型拆步骤 + 挑出每步真正需要的文件
         (只把这些文件发给网页模型), 代码交给网页模型(ChatGPT/DeepSeek 页面)写。</div>
       <div class="set-row">
-        <label>规划模型类型</label>
-        <select id="setType">
+        <label for="setTypeBtn">规划模型类型</label>
+        <!-- 原生 select 只当状态容器(代码里 6 处读它的 .value / 派 change 事件), 画出来的是下面这个按钮 -->
+        <select id="setType" hidden tabindex="-1" aria-hidden="true">
           <option value="web">网页当前 Provider(免 Key; 只能规划/摘要, 不能落盘)</option>
           <option value="api">OpenAI 兼容官方 API(DeepSeek/OpenAI 等; 可落盘, 要 Key)</option>
           <option value="local">本地模型(LM Studio / llama.cpp 等; 不用 Key, 可落盘)</option>
         </select>
+        <button type="button" class="pick" id="setTypeBtn" aria-haspopup="listbox" aria-expanded="false">
+          <span class="pick-t"></span><span class="caret">▾</span></button>
         <button type="button" id="setDetect">🔍 检测本地模型(LM Studio / llama.cpp / vLLM / Ollama)</button>
       </div>
       <div class="set-row api-only"><label>API Base URL</label>
