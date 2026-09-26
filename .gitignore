@@ -10,6 +10,7 @@ profile/**
 .tmp/**
 workspace/
 .bridge_settings.json
+transcripts/
 logs/
 *.log
 

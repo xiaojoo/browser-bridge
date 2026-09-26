@@ -1,5 +1,6 @@
 """「只用本地模型」的服务端那一轮: 事件顺序要和网页模型完全一致
-(message_start -> delta* -> message_end), 没配置时要有可照做的提示。
+(status? -> message_start -> delta* -> message_end; 开头那条 status 是入口占到互斥时广播的,
+ 不算轮次事件), 没配置时要有可照做的提示。
 
 打桩 planner / settings / broadcast, 不联网、不碰真实设置文件, 也不启动浏览器。
 """
@@ -57,10 +58,15 @@ async def main() -> int:
         print("已配置时:", getattr(resp2, "status_code", 200), json.dumps(body2, ensure_ascii=False))
         await asyncio.sleep(0.3)
         print("事件序列:", SEEN)
-        if SEEN[:1] != ["message_start"]:
-            bad.append("不是先 message_start: " + json.dumps(SEEN))
-        if SEEN[-1:] != ["message_end"]:
-            bad.append("结尾不是 message_end(前端要靠它收尾+入历史): " + json.dumps(SEEN))
+        # 入口 claim 到互斥时会先广播一条 status(告诉界面"我忙起来了"), 它不属于轮次事件;
+        # 网页模型那条路现在也一样, 所以两边仍然一致。
+        core = [t for t in SEEN if t != "status"]
+        if SEEN[:1] != ["status"]:
+            bad.append("入口没先广播 busy 状态(界面要到 message_start 才知道在忙): " + json.dumps(SEEN))
+        if core[:1] != ["message_start"]:
+            bad.append("不是先 message_start: " + json.dumps(core))
+        if core[-1:] != ["message_end"]:
+            bad.append("结尾不是 message_end(前端要靠它收尾+入历史): " + json.dumps(core))
         if SEEN.count("delta") != 2:
             bad.append("增量没有逐段推: " + json.dumps(SEEN))
         if "error" in SEEN:

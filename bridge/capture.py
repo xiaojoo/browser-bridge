@@ -113,6 +113,15 @@ _DRAIN_JS = ("() => { const c = window.__dsCap; if (!c) return []; "
 
 # DOM -> Markdown: 站点里加粗/标题/列表/代码块的结构要保住, 否则 innerText 会把整段压成纯文本
 _DOM_TO_MD = r"""
+  const __imgMd = (n) => {
+    // 用 currentSrc/src(DOM 属性给的是绝对地址), 不是 getAttribute('src') —— 站点常写相对路径
+    let src = String(n.currentSrc || n.src || n.getAttribute('src') || '');
+    const alt = String(n.getAttribute('alt') || '').replace(/[\[\]\n\r]/g, ' ').trim().slice(0, 120);
+    // data: 可能是几 MB 的 base64, 写进一行 JSONL 会把整份记录撑爆 -> 只留占位
+    if (!src || src.slice(0, 5).toLowerCase() === 'data:' || src.slice(0, 11) === 'javascript:')
+      return '[' + (alt || '图片') + ']';
+    return '![' + (alt || '图片') + '](' + src + ')';
+  };
   const __inlineOf = (el) => {
     let s = '';
     for (const n of el.childNodes) {
@@ -127,7 +136,7 @@ _DOM_TO_MD = r"""
       else if (t === 'a') {
         const href = n.getAttribute('href') || '', x = __inlineOf(n).trim();
         s += (href && href.charAt(0) !== '#' && x) ? '[' + x + '](' + href + ')' : x;
-      } else if (t === 'img') { s += '[' + (n.getAttribute('alt') || '图片') + ']'; }
+      } else if (t === 'img') { s += __imgMd(n); }
       else { s += __inlineOf(n); }
     }
     return s;
@@ -197,6 +206,10 @@ _DOM_TO_MD = r"""
             if (cells.length) lines.push(cells.join(' | '));
           }
           lines.push('');
+        } else if (t === 'img') {
+          // 关键: 图片常常是 div 的直接子节点, 走不到 __inlineOf 的 img 分支 ——
+          // 那边只遍历子节点, 而 <img> 没有子节点, 于是整张图被吃成空串(实测 3 张图 -> 0 字)。
+          cur += __imgMd(n);
         } else if (t === 'div' || t === 'section' || t === 'article' || t === 'main' || t === 'details' || t === 'summary') {
           walk(n);
           flush();

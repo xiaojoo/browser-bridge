@@ -245,6 +245,10 @@ def _check_op(item: dict) -> tuple[str, str, str | None, str | None]:
     op = str(item.get("op", "")).lower()
     if op not in ("create", "update", "delete"):
         return "", "", None, f"未知 op: {op}"
+    if item.get("blocked"):
+        # 认得出内容、但目标不确定(比如工作区里有多个同名文件): 原因走 err 这一槽,
+        # 卡片才会把"要我写哪个路径"照原样念出来, 而不是变成一句"未知 op"
+        return "", "", None, str(item["blocked"])
     raw = str(item.get("path", "")).strip().replace("\\", "/")
     path = raw.lstrip("/")
     # 只拦真正危险的路径: 空/越界/绝对路径/仓库内部(.git)。
@@ -329,8 +333,12 @@ def apply_manifest(obj: dict):
             else:
                 old = _read_old(op, path)
                 if content.replace("\r\n", "\n") != old:
+                    bak = workspace.backup_file(path) if old else ""
                     res = workspace.write_file(path, content)
-                    applied.append({"path": path, "op": op, "size": res["size"]})
+                    applied.append({"path": path, "op": op, "size": res["size"],
+                                    "backup": bak})
+                    if bak:
+                        log.info("覆盖前已备份 %s -> %s", path, bak)
                     if old:
                         st = _diff_stats(old, content)
                         diffs.append({"path": path, "add": st["add"], "del": st["del"]})
@@ -489,19 +497,88 @@ def strip_fence_labels(text: str) -> str:
 
 
 def _resolve_any(raw: str, tree_set: set, base: dict) -> str:
-    """把一段文本里抠出来的路径对齐到工作区; 对不上就按"新文件"原样收下(仅限看着像文件名的)。"""
+    """只要一个落点(供"猜是哪个文件"这类旁路用); 需要"同名都写"的场合用 `_resolve_paths`。"""
+    got = _resolve_paths(raw, tree_set, base)
+    return got[0] if got else ""
+
+
+def _resolve_paths(raw: str, tree_set: set, base: dict) -> list:
+    """把一段文本里抠出来的路径对齐到工作区, 返回**这次该写的全部路径**。
+
+    `base` 是 basename -> **该名下所有路径的列表**。以前它是 `{名字: 路径}`, 同一个名字在工作区里
+    出现两次时后写的覆盖先写的, 于是"回答里只写了 index.html"就可能去**覆盖任意另一个目录里同名的
+    真实文件**(实测覆盖掉一个 276 字节的真 index.html)。中间一版改成"同名一律不猜、直接拦下",
+    2026-09-26 他定成现在这样: **都在当前工作区里就都替换** —— 每个落点写之前都会各自备份
+    (见 workspace.backup_file), 卡片上是一行一个完整路径。
+    """
     tokens = str(raw or "").strip().strip("`*\"'()[]<>").replace("\\", "/").split()
     if not tokens:
-        return ""
+        return []
     cand = tokens[0].lstrip("./")
     if not cand:
-        return ""
+        return []
     if cand in tree_set:
-        return cand
-    hit = base.get(cand.split("/")[-1])
-    if hit:
-        return hit
-    return cand if _PATH_RE.fullmatch(cand) else ""
+        return [cand]
+    hits = sorted(base.get(cand.split("/")[-1]) or [])
+    if len(hits) > 1:
+        log.info("路径 %r 在工作区里有 %d 个同名文件 -> 按同名都替换: %s",
+                 cand, len(hits), ", ".join(hits[:6]))
+    if hits:
+        return hits
+    return [cand] if _PATH_RE.fullmatch(cand) else []
+
+
+def _base_map(tree_set) -> dict:
+    """basename -> 该名字下的全部路径(供 _resolve_any 判断"有没有歧义")。"""
+    out: dict[str, list] = {}
+    for p in tree_set or []:
+        out.setdefault(str(p).split("/")[-1], []).append(p)
+    return out
+
+
+_FENCE_OPEN = re.compile(r"^ {0,3}(`{3,})[ \t]*(.*)$")
+
+
+def fence_blocks(text: str):
+    """按**行**配对代码围栏, 产出 `(info, body, prose_before)` 序列。
+
+    为什么不用一个 ```...``` 的正则: 站点会把"项目结构"那种小块写成**开闭反引号在同一行**
+    (``` 3d-tetris/ ├── index.html ```). 正则要求开围栏后必须紧跟换行, 于是那一行开头的
+    ``` 不算开围栏、结尾的 ``` 被当成下一块开头 —— 后面所有配对整体错一位: 真正的代码
+    变成"块与块之间的正文"一个字都提不出来, 而 `## index.html` 这种标题+语言标签反而
+    被当成代码文件写进工作区(实测: 三段代码 817/892/5181 字全丢, 写出去的是 23 字的标题)。
+    """
+    lines = (text or "").split("\n")
+    out, prose, i = [], [], 0
+    while i < len(lines):
+        m = _FENCE_OPEN.match(lines[i])
+        if not m:
+            prose.append(lines[i])
+            i += 1
+            continue
+        ticks, rest = m.group(1), m.group(2)
+        if rest.rstrip().endswith(ticks):                    # 同行就闭合: ``` a b c ```
+            out.append(("", rest.rstrip()[:-len(ticks)].strip(), "\n".join(prose)))
+            prose, i = [], i + 1
+            continue
+        body, j, closed = [], i + 1, False
+        while j < len(lines):
+            mm = _FENCE_OPEN.match(lines[j])
+            if mm and mm.group(2).strip().startswith(mm.group(1)) and \
+                    mm.group(2).strip().endswith(mm.group(1)):
+                head = mm.group(2).strip()[:-len(mm.group(1))].rstrip()
+                if head:
+                    body.append(head)                        # 内容和闭围栏挤在一行
+                closed = True
+                break
+            if mm and not mm.group(2).strip():               # 一行只有反引号 = 收尾
+                closed = True
+                break
+            body.append(lines[j])
+            j += 1
+        out.append((rest.strip(), "\n".join(body), "\n".join(prose)))
+        prose, i = [], (j + 1 if closed else j)
+    return out
 
 
 def _looks_like_path(p: str) -> bool:
@@ -591,8 +668,8 @@ def _looks_like_name_line(ln: str, path: str) -> bool:
     return rest in ("", "文件", "file", "文件名", "路径", "path", "new file")
 
 
-def _nearby_path(before: str, tree_set: set, base: dict) -> str:
-    """围栏**前面几行**里提到的文件: 工作区里真实存在的优先;
+def _nearby_path(before: str, tree_set: set, base: dict) -> list:
+    """围栏**前面几行**里提到的文件: 工作区里真实存在的优先; 返回该写的全部路径。
 
     不存在的路径只有在"这行确实在说某个文件"时才认(否则宁可不猜)。三种认法:
       1. 路径就在工作区里(最可信);
@@ -603,18 +680,18 @@ def _nearby_path(before: str, tree_set: set, base: dict) -> str:
     """
     lines = [ln for ln in (before or "").splitlines() if ln.strip()]
     for ln in reversed(lines[-6:]):
-        cands = [c for c in (_resolve_any(t, tree_set, base) for t in _PATH_RE.findall(ln)) if c]
-        if not cands:
+        groups = [g for g in (_resolve_paths(t, tree_set, base) for t in _PATH_RE.findall(ln)) if g]
+        if not groups:
             continue
-        intree = [c for c in cands if c in tree_set]
+        intree = [g for g in groups if g[0] in tree_set]
         if intree:
-            return intree[-1]
+            return intree[-1]                     # 整组都返回: 裸名对上多个同名时不能只留第一个
         if any(w in ln.lower() for w in _FILE_TALK_WORDS):
-            return cands[-1]
-        named = [c for c in cands if _looks_like_name_line(ln, c)]
+            return groups[-1]                   # 这行确实在说"改某个文件" -> 同名就都要
+        named = [g for g in groups if any(_looks_like_name_line(ln, p) for p in g)]
         if named:
             return named[-1]
-    return ""
+    return []
 
 
 def extract_code_files(answer: str, tree_lines: list[str]) -> tuple[list[dict], int]:
@@ -635,7 +712,7 @@ def extract_code_files(answer: str, tree_lines: list[str]) -> tuple[list[dict], 
     """
     a = strip_fence_labels(answer or "")      # 去掉"围栏第一行的语言名", 免得它变成文件第一行
     tree_set = set(tree_lines or [])
-    base = {p.split("/")[-1]: p for p in tree_set}
+    base = _base_map(tree_set)
 
     obj, _src = extract_manifest(a)
     if obj and (obj.get("files") or []):          # 网页模型自己给了清单 -> 直接用
@@ -657,44 +734,45 @@ def extract_code_files(answer: str, tree_lines: list[str]) -> tuple[list[dict], 
         log.info("清单解析出来 %d 条但一条都没对上工作区, 改按代码围栏整理", len(obj["files"]))
 
     items, loose = [], 0
-    matches = list(_FENCE_RE.finditer(a))
-    prev_end = 0
-    for m in matches:
-        prose_before = a[prev_end:m.start()]          # 两段围栏之间的正文(不含围栏自身)
-        prev_end = m.end()
-        info, body = (m.group(1) or "").strip(), m.group(2) or ""
+    for info, body, prose_before in fence_blocks(a):
+        body = body or ""
         if not body.strip():
             continue
         if _is_manifest_block(body):
             continue              # 清单本身不是"某个文件的代码", 也别算成没认出文件名的代码块
-        path = _resolve_any(_path_from_info(info), tree_set, base)
-        if not path:
+        paths = _resolve_paths(_path_from_info(info), tree_set, base)
+        if not paths:
             first = body.strip().splitlines()[0] if body.strip() else ""
             if first.lstrip().startswith(_COMMENT_HEADS):
-                path = _resolve_any(first, tree_set, base)
-        if not path:
-            path = _nearby_path(prose_before, tree_set, base)
-        if not path:
-            loose += 1                            # 认不出就不猜
+                paths = _resolve_paths(first, tree_set, base)
+        if not paths:
+            paths = _nearby_path(prose_before, tree_set, base)
+        if not paths:
+            loose += 1                            # 认不出文件就不猜
             continue
-        items.append({"op": "update" if path in tree_set else "create", "path": path,
-                      "content": body.rstrip("\n") + "\n", "source": "fence"})
+        # 一个名字在工作区里对上多个同名文件 -> 每个都写一条(写之前各自备份), 不再拦下来问路径
+        for p in paths:
+            items.append({"op": "update" if p in tree_set else "create", "path": p,
+                          "content": body.rstrip("\n") + "\n", "source": "fence",
+                          **({"fanout": len(paths)} if len(paths) > 1 else {})})
     return _dedupe_items(items), loose
 
 
 def guess_paths(answer: str, tree_lines: list[str], limit: int = 6) -> list[str]:
     """回答里出现过的文件路径(含只写在说明文字里的), 按出现顺序、去重。"""
     tree = set(tree_lines or [])
-    base = {p.split("/")[-1]: p for p in tree}
+    base = _base_map(tree)
     out: list[str] = []
     for m in _PATH_RE.finditer(answer or ""):
         raw = m.group(0).replace("\\", "/").lstrip("./")
-        cand = raw if raw in tree else base.get(raw.split("/")[-1], "")
-        if cand and cand not in out:
-            out.append(cand)
+        hits = base.get(raw.split("/")[-1]) or []
+        cand = [raw] if raw in tree else sorted(hits)   # 同名多个 -> 全都列出来
+        for c in cand:
+            if c and c not in out:
+                out.append(c)
         if len(out) >= limit:
             break
-    return out
+    return out[:limit]
 
 
 def checks_text(checks) -> str:

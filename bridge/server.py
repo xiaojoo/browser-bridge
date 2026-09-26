@@ -24,8 +24,8 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
-from . import (capture, config, engineer, events, file_operator, planner, providers,
-               settings, workspace)
+from . import (capture, config, engineer, events, file_operator, media, planner,
+               providers, settings, transcript, workspace)
 from .browser import BrowserManager
 
 log = logging.getLogger("bridge")
@@ -37,6 +37,7 @@ _staged_files: dict[str, dict] = {}   # id -> {name, mime, data}
 _recent_msgs: list[dict] = []         # 最近几轮对话(桥发出去的), 换窗口接力时的兜底上下文
 _RECENT_MAX = 40
 _last_extract: list[dict] = []        # 最近一次"整理出来的文件改动"(卡片上那个"写入工作区"按钮用)
+_last_handoff: dict = {}              # 最近一次上下文接力的构成(笔记/原文片段/落盘路径), 给预览接口看
 
 
 def _stage_file(data: bytes, name: str, mime: str) -> str:
@@ -54,6 +55,65 @@ def _spawn(coro) -> asyncio.Task:
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
     return task
+
+
+# ---------- 互斥: "空闲就占住" 必须一步做完 ----------
+# 以前的写法是 `if manager.busy: 409` 然后 `_spawn(后台协程)`, 而 busy=True 要等那个协程
+# 真的被调度起来才设 —— 中间隔着若干次 await, 第二个请求能挤进来, 于是两路同时驱动同一个
+# page(表现为串话/捕获切页/两条回答叠在一起)。现在入口先 claim(检查与置位之间没有任何
+# await, 所以是原子的), 后台协程只负责 release。
+def claim(why: str) -> bool:
+    """空闲就立刻占住并说明在干什么; 已经忙返回 False。这里绝不能有 await。"""
+    if manager.busy:
+        return False
+    manager.busy = True
+    manager.busy_reason = why
+    return True
+
+
+def _busy_why() -> str:
+    """409 时要说清"是谁占着", 只说"正在生成中"会让人以为聊天卡住了。"""
+    r = getattr(manager, "busy_reason", "") or "忙"
+    return "正在" + r + ", 请稍候"
+
+
+async def _claim_or_409(why: str):
+    """占住互斥并广播状态; 占不住就返回一个 409 响应, 调用方直接 return 它。"""
+    if not claim(why):
+        return JSONResponse({"ok": False, "error": _busy_why()}, status_code=409)
+    await broadcast(events.status_event(**manager.status()))
+    return None
+
+
+async def release() -> None:
+    manager.busy = False
+    manager.busy_reason = ""
+    await broadcast(events.status_event(**manager.status()))
+
+
+async def store_messages(conv: str, msgs: list[dict], source: str, turn: str = "") -> dict:
+    """落盘前先把回答里的远程图片抓到本地, 再写 JSONL。
+
+    顺序不能反: 先抓图 -> 存进去的正文就已经是本地相对路径, 之后重复同步正文不变,
+    去重才认得出"还是这一条"; 反过来存了远程地址, 下次抓到本地图文就变了、会多写一版。
+    """
+    page = manager.page
+    out = []
+    stat = {"found": 0, "saved": 0, "failed": 0, "skipped": 0}
+    for m in msgs or []:
+        t = str(m.get("text") or "")
+        if "![" in t:
+            t, s = await media.harvest(page, manager.provider.id, conv, t)
+            m = dict(m, text=t)
+            for k in stat:
+                stat[k] += s.get(k, 0)
+        out.append(m)
+    w = await transcript.append(manager.provider.id, conv, out, source=source, turn=turn)
+    w["media"] = stat
+    if stat["saved"] or stat["failed"] or stat["skipped"]:
+        log.info("图片本地化 %s: 共 %d 张, 存下 %d, 失败 %d, 超预算没试 %d(原地址都保留)",
+                 w["conv"], stat["found"], stat["saved"], stat["failed"], stat["skipped"])
+    return w
 
 
 async def broadcast(payload: dict):
@@ -101,6 +161,10 @@ class OpenConvRequest(BaseModel):
     url: str = ""
 
 
+class HandoffPreviewRequest(BaseModel):
+    task: str = Field(default="", max_length=4000)   # 下一棒要办的事: 笔记按它来筛
+
+
 class WorkspaceRootRequest(BaseModel):
     path: str = ""            # 绝对路径; 空 = 恢复默认工作区
 
@@ -127,9 +191,7 @@ class SettingsPlanner(BaseModel):
 
 class SettingsEngine(BaseModel):
     repo: str = ""
-    auto_apply: str = ""
     confirm_apply: str = ""
-    auto_test: str = ""
     test_cmd: str = ""
 
 
@@ -147,8 +209,6 @@ async def _run_turn(text: str, files: list[dict] | None = None):
         return
 
     await broadcast(events.message_start(mid, None))
-    manager.busy = True
-    await broadcast(events.status_event(**manager.status()))
 
     async def on_delta(kind, chunk, snapshot):
         nonlocal counters
@@ -263,13 +323,22 @@ async def _run_turn(text: str, files: list[dict] | None = None):
         # 站点有时不会在发送后清空输入框: 内容还留着就清掉(否则它会变成草稿, 下次又冒出来)
         await _cleanup_composer_after_turn(manager, text, mid)
     finally:
-        manager.busy = False
-        await broadcast(events.status_event(**manager.status()))
+        await release()
+
+    # 先落盘, 再宣布本轮结束: 否则界面/下游在 message_end 之后立刻去读文件会读不到这一条。
+    # conv 这里重读一次 —— 发送那一刻 ChatGPT 的 URL 常常还没跳到 /c/<会话id>,
+    # 拿那个临时值当文件名会把一轮写到不相干的垃圾文件里去。
+    conv = manager.conversation_id() or conv
+    w = await store_messages(conv, [{"role": "user", "text": text},
+                                     {"role": "assistant", "text": answer.get("text") or ""}],
+                              "captured", turn=mid)
+    log.info("turn[%s] 本轮落盘 -> %s: 新写 %d 条(跳过 %d)", mid[:8], w["conv"],
+             w["written"], w["skipped"])
+    _remember_turn(text, answer.get("text") or "")
 
     if errors:
         await broadcast(events.info_event("本轮流中有警告: " + "; ".join(errors[:3])))
     await broadcast(events.message_end(mid, conv, truncated=truncated))
-    _remember_turn(text, answer.get("text") or "")
 
 
 def _remember_turn(user_text: str, answer_text: str):
@@ -282,16 +351,48 @@ def _remember_turn(user_text: str, answer_text: str):
 
 
 # ---------- 站点上下文到上限 -> 自动换窗口时的"上下文接力" ----------
-# 新窗口是空白的: 直接把原话重发, 网页模型就"失忆"了。所以换窗口之前先把上一段对话
-# 汇总成一份接力上下文(本地/规划模型只做**汇总**, 不写代码), 拼在新消息前面一起发过去。
+# 新窗口是空白的: 直接把原话重发, 网页模型就"失忆"了。所以换窗口之前把上一段整理成一份
+# **交接笔记**(本地/规划模型只做整理, 不写代码), 再从落盘那份逐条原文里按"这一棒要办的事"
+# 捞几条细节回来, 一起拼在新消息前面发过去。
+# 笔记的结构和纪律照 relayhand(yanlin-cheng/relayhand)那套: 只有「下一步」允许详细,
+# 其余各节都为它服务 —— 换会话而不是压缩会话, 但细节得有地方能找回来。
 _HANDOFF_PROMPT = (
     "下面是一段对话(用户和网页版 AI 在聊一个具体任务)。它的上下文已经到上限, 要换一个新窗口接着聊, "
-    "新窗口里对方**什么都不记得**。请把这段对话汇总成一份可以直接放进新窗口开场的上下文。\n"
-    "要求:\n"
-    "1. 简体中文; 小标题 + 要点, 不要寒暄、不要复述原话、不要评价这段对话;\n"
-    "2. 必须留住: 用户的目标、已经确认的结论/事实、当前进度、待办与下一步, 以及之后会用到的"
-    "具体细节(文件路径、命令、参数、版本号、报错原文里的关键片段);\n"
-    "3. 总长不超过 1200 字; 直接输出这份上下文本身。")
+    "新窗口里对方**什么都不记得**。请把这段对话整理成一份放进新窗口开场的**交接笔记**。\n"
+    "写法: 全程克制, 只有「下一步」这一节允许详细; 不复述对话过程、不寒暄、不评价。\n"
+    "按这个结构输出, 没有内容的小节整节删掉, 不要凑字:\n"
+    "# 交接: <一句话说清在做什么>\n"
+    "## 目标\n<一句话; 如果需要超过一句, 说明你还没提炼出来, 重写>\n"
+    "## 进度\n- 已完成: <逐条>\n- 进行中: <现在正在动哪一块>\n- 卡住: <障碍 / 未决问题>\n"
+    "## 关键决定\n<只写影响后面工作的技术选择, 并带上为什么>\n"
+    "## 坑(别再犯)\n<试过但失败的做法及原因; 排查结论按 症状 -> 根因 -> 修法>\n"
+    "## 下一步\n<可直接照做的顺序动作, 具体到命令 / 文件 / 参数>\n"
+    "## 文件\n读过: <真实路径>\n改过: <真实路径; 未提交的改动也算改过>\n"
+    "纪律:\n"
+    "1. 读者是下一棒的模型, 不是用户; 写接力棒, 不写复盘;\n"
+    "2. 只写事实; 文件路径必须从对话里摘出来, 不许凭印象编;\n"
+    "3. 用户最新提的那个要求, 在「下一步」里**原话引用**, 不要转述;\n"
+    "4. 不要写 API Key、密码、个人信息;\n"
+    "5. 简体中文, 总长不超过 1500 字; 只输出这份笔记本身。")
+
+_NOTE_MAX = 6000            # 笔记本身带进新窗口的上限(字)
+# 原文片段是个近似线性的拨盘, 没有聪明的工作点: 在真实那段 56 条/11.8 万字的对话上量过,
+# 每 1000 字换回 4~6 个"只出现在少数几条里的低频细节"(3000 字≈17 个, 12000 字≈58 个),
+# 再多就只是按比例涨。取 12000 是因为新窗口本来就是空白的, 这点体积换 3 倍细节划算。
+_EXCERPT_BUDGET = 12000     # 从落盘原文里捞回来的细节总量(字)
+_EXCERPT_ITEMS = 6          # 最多几条
+_NOTE_AS_QUERY = 1500       # 拿笔记开头这几个字一起当检索词: 用户不会把字段名再敲一遍
+_CARRY_MAX = 20000          # 接力上下文整体硬上限 —— 它要占掉新窗口的一截输入
+
+
+def _handoff_prompt(task: str) -> str:
+    """把"这一棒要办的事"当成笔记的过滤器; 没说就退化成通用笔记。"""
+    t = " ".join(str(task or "").split())[:400]
+    if not t:
+        return _HANDOFF_PROMPT
+    return (_HANDOFF_PROMPT + "\n\n这一棒接着要办的事: 「" + t + "」\n"
+            "把它当过滤器: 笔记只留这件事用得到的背景 / 决定 / 文件 / 坑; "
+            "跟它无关的再重要也不要写进来, 标题也围绕这件事起。")
 
 
 def _conversation_digest(msgs: list[dict], limit: int = 60000) -> str:
@@ -311,41 +412,105 @@ def _conversation_digest(msgs: list[dict], limit: int = 60000) -> str:
     return (head + "\n\n……(中间省略 " + str(len(text) - limit) + " 字)……\n\n" + tail)
 
 
-async def _handoff_context(manager) -> str:
-    """换新窗口之前: 把当前这段对话汇总成"接力上下文"(没有可汇总的就返回空串)。"""
+async def _handoff_context(manager, task: str = "", arm_relay: bool = False) -> str:
+    """换新窗口之前: 把当前这段对话整理成"接力上下文"(没有可整理的内容就返回空串)。
+
+    task = 这一棒正要办的事(就是那条发不出去的新消息), 笔记和原文片段都按它来筛。
+
+    arm_relay=True 只在**真的要换窗口**时由浏览器回调传进来: 它会把当前会话记成"下一段对话
+    的上游"。「只汇总不发送」的预览接口不能传 —— 不然点一次预览, 之后打开的任何一段不相干
+    的旧对话都会被写上 relay_of 指回预览时那段, 接力链就成假的了。
+    """
     msgs: list[dict] = []
+    w: dict = {}
+    site_ok = False
+    _last_handoff.clear()          # 早退时别让预览接口读到上一次的构成
     try:
         site = await manager.read_conversation()
         if site.get("ok"):
             msgs = site.get("messages") or []
+            conv = str(site.get("conversation_id") or manager.conversation_id() or "")
+            # 整理之前先把原件逐条落盘: 笔记装不下的细节, 之后还能按关键词回来查
+            site_ok = True
+            w = await store_messages(conv, msgs, "site")
+            if arm_relay:
+                transcript.mark_relay(manager.provider.id, w["conv"])
+            log.info("接力前落盘 %s: 读到 %d 条, 新写 %d 条(跳过已有 %d) -> %s",
+                     w["conv"], len(msgs), w["written"], w["skipped"], w["path"])
     except Exception as exc:  # noqa: BLE001
         log.warning("读站点对话失败(改用本地记录): %s", exc)
     if not msgs:
         msgs = list(_recent_msgs)          # 站点读不回来(DeepSeek 之类)-> 用桥自己发过的
     if not msgs:
+        _last_handoff["why"] = ("上一段对话读回来是空的: 站点那段还没有消息, 或者页面结构改版读不到了"
+                                if not site_ok else "站点说读到了但一条消息都没有")
         await broadcast(events.info_event("要换新窗口了, 但没读到上一段对话, 这次不带上下文"))
         return ""
     pcfg = settings.load().get("planner", {})
     if not planner_ready(pcfg):
+        _last_handoff["why"] = "没配「规划模型」: 设置里选本地模型或填 API Key 才能自动接力"
         await broadcast(events.info_event(
             "站点上下文到上限, 已换新窗口; 但没配「规划模型」, 没法把上一段汇总带过去"
             "(设置里选本地模型或填 API Key 就能自动接力)"))
         return ""
     digest = _conversation_digest(msgs)
     try:
-        out = (await planner.ask(pcfg, _HANDOFF_PROMPT + "\n\n【对话】\n" + digest) or "").strip()
+        out = (await planner.ask(pcfg, _handoff_prompt(task) + "\n\n【对话】\n" + digest)
+               or "").strip()
     except planner.PlannerError as exc:
+        _last_handoff["why"] = "规划模型调用失败: " + str(exc)[:120]
         log.warning("汇总上下文失败: %s", exc)
         await broadcast(events.info_event("汇总上一段上下文失败: " + str(exc)[:120]))
         return ""
     if not out:
+        _last_handoff["why"] = "规划模型返回了空"
         return ""
-    log.info("上下文接力: 读到 %d 条消息, 汇总成 %d 字", len(msgs), len(out))
-    return ("【上一个窗口的上下文(本地模型汇总: 网页那边上下文到上限, 已换新窗口)】\n"
-            + out[:6000] + "\n【以上是之前聊的内容, 请接着继续】")
+
+    # 笔记只有一千多字, 报错原文/参数/路径这类东西装不下 —— 从落盘那份按这件事捞几条原文。
+    # 给网页模型一个本地路径它读不了, 所以真正把细节带过去的是这几段原文本身。
+    q = (task or "").strip() or next((str(m.get("text") or "") for m in reversed(msgs)
+                                      if str(m.get("role")) == "user"), "")
+    ex = transcript.excerpt_for(manager.provider.id, w.get("conv"), q,
+                                budget=_EXCERPT_BUDGET, max_items=_EXCERPT_ITEMS,
+                                extra_query=out[:_NOTE_AS_QUERY]) if w else []
+    parts = ["【上一窗口的交接: 网页那边上下文到了上限, 已经换到新窗口, 这边不记得任何事。"
+             "读完直接按「下一步」动手, 不要复述这份笔记】", out[:_NOTE_MAX]]
+    if ex:
+        parts.append("【上一段对话里跟这件事最相关的原文片段 —— 笔记没装下的细节在这里, "
+                     "以原文为准, 不要凭印象补】\n"
+                     + "\n\n".join("【" + ("用户" if str(e.get("role")) == "user" else "助手")
+                                   + "·原文】" + str(e.get("text") or "") for e in ex))
+    if w:
+        parts.append("(上一段的完整逐条记录存在本地 " + str(w.get("rel"))
+                     + " —— 还缺细节就管用户要, 不要自己编。)")
+    carry = "\n\n".join(parts)
+    if len(carry) > _CARRY_MAX:
+        carry = carry[:_CARRY_MAX] + "\n【接力上下文到这里截断, 后面的没带过来; 缺什么管用户要】"
+    _last_handoff.update({"conv": w.get("conv") or "", "path": str(w.get("path") or ""),
+                          "rel": str(w.get("rel") or ""), "records": len(msgs),
+                          "conv_chars": sum(len(str(m.get("text") or "")) for m in msgs),
+                          "note_chars": len(out[:_NOTE_MAX]),
+                          "excerpts": len(ex), "excerpt_chars": sum(len(str(e.get("text") or ""))
+                                                                   for e in ex),
+                          "carry_chars": len(carry), "carry_max": _CARRY_MAX,
+                          "note": out[:_NOTE_MAX],
+                          "excerpt_list": [{"role": str(e.get("role") or ""),
+                                            "chars": len(str(e.get("text") or "")),
+                                            "head": " ".join(str(e.get("text") or "").split())[:70]}
+                                           for e in ex],
+                          "task": q[:200]})
+    log.info("上下文接力: %d 条消息 -> 笔记 %d 字 + 原文片段 %d 条 %d 字, 共 %d 字 (%s)",
+             len(msgs), _last_handoff["note_chars"], len(ex),
+             _last_handoff["excerpt_chars"], len(carry), w.get("path") or "未落盘")
+    if arm_relay and w:
+        # 只存笔记本体: 原文片段随时能从同一份 JSONL 按同一件事重新捞出来
+        rly = transcript.write_relay(manager.provider.id, w["conv"], out[:_NOTE_MAX],
+                                     task=q, meta=_last_handoff)
+        log.info("交接笔记存 -> %s", rly["path"])
+    return carry
 
 
-manager.on_context_limit = _handoff_context
+manager.on_context_limit = lambda m, task="": _handoff_context(m, task, arm_relay=True)
 
 
 
@@ -576,7 +741,6 @@ async def ws_delete(path: str = ""):
 
 # ---------- 编码执行器(Phase 2) ----------
 async def _run_engineer(req: EngineerRequest):
-    manager.busy = True
     try:
         await broadcast(events.status_event(**manager.status()))
         async def emit(stage: str, text: str, extra: dict):
@@ -606,16 +770,15 @@ async def _run_engineer(req: EngineerRequest):
         await broadcast(events.event("engineer", stage="error",
                                      text=f"执行器异常: {exc}", result={}))
     finally:
-        manager.busy = False
-        await broadcast(events.status_event(**manager.status()))
+        await release()
 
 
 @app.post("/api/engineer/run")
 async def api_engineer(req: EngineerRequest):
     if manager.state != "logged_in":
         return JSONResponse({"error": "浏览器未就绪/未登录"}, status_code=503)
-    if manager.busy:
-        return JSONResponse({"error": "正在执行任务(聊天或工程), 请稍候"}, status_code=409)
+    if (r := await _claim_or_409("工程任务")) is not None:
+        return r
     _spawn(_run_engineer(req))
     return {"ok": True, "state": "queued"}
 
@@ -648,17 +811,15 @@ async def api_file_operate(req: FileOperateRequest):
             return {"ok": True, "action": "read_file", "result": result}
 
         if action == "send_file":
-            if manager.busy:      # 正在生成/发送时不要再动站点的输入框/附件区
+            # 正在生成/发送时不要再动站点的输入框/附件区
+            if not claim("发送附件"):
                 return JSONResponse({"ok": False, "action": "send_file",
-                                     "error": "浏览器正在处理其他任务, 请稍候"},
-                                    status_code=409)
-            manager.busy = True
+                                     "error": _busy_why()}, status_code=409)
             await broadcast(events.status_event(**manager.status()))
             try:
                 result = await file_operator.send_file(manager, path)
             finally:
-                manager.busy = False
-                await broadcast(events.status_event(**manager.status()))
+                await release()
             log.info("file operation: send_file path=%s size=%s",
                      result.get("path"), result.get("size"))
             return {"ok": True, "action": "send_file", "result": result}
@@ -702,8 +863,6 @@ async def _run_local_turn(text: str, history: list[dict], pcfg: dict):
     mid = events.new_message_id()
     conv = manager.conversation_id()
     await broadcast(events.message_start(mid, conv))
-    manager.busy = True
-    await broadcast(events.status_event(**manager.status()))
     got = False
     try:
         async def on_chunk(piece: str):
@@ -724,8 +883,7 @@ async def _run_local_turn(text: str, history: list[dict], pcfg: dict):
         await broadcast(events.error_event(mid, conv, "本地模型调用失败: " + str(exc)))
         return
     finally:
-        manager.busy = False
-        await broadcast(events.status_event(**manager.status()))
+        await release()
     await broadcast(events.message_end(mid, conv))
 
 
@@ -735,8 +893,8 @@ async def api_local_chat(req: LocalChatRequest):
     pcfg = settings.load().get("planner", {})
     if not planner_ready(pcfg):
         return JSONResponse({"error": PLANNER_NEEDED_HINT}, status_code=400)
-    if manager.busy:
-        return JSONResponse({"error": "正在生成中, 请稍候"}, status_code=409)
+    if (r := await _claim_or_409("本地模型回答")) is not None:
+        return r
     _spawn(_run_local_turn(req.text, req.history, pcfg))
     return {"ok": True, "state": "queued", "model": pcfg.get("api_model") or ""}
 
@@ -809,9 +967,12 @@ async def api_world_apply(req: WorldApplyRequest):
                                  "text": text, "loose": loose, "files": [], "empty": True,
                                  "ts": time.time()}
         _world_state["verify"] = None
-        await broadcast(events.event("world", stage="apply", action="skipped",
-                                     no_changes=True, reason=why, text=text,
-                                     files=[], loose=loose, empty=True, ts=time.time()))
+        # dry_run 时不广播: 发这个请求的人(worldPipeline)拿着同一份返回值, 会自己画卡片 ——
+        # 两边都画就会出现"一张空白卡 + 一张说明卡"(空白那张是 handleApplyEvent 建的)。
+        if not req.dry_run:
+            await broadcast(events.event("world", stage="apply", action="skipped",
+                                         no_changes=True, reason=why, text=text,
+                                         files=[], loose=loose, empty=True, ts=time.time()))
         log.info("world apply: 跳过(没认出可写入的文件): %s (loose=%d)", why, loose)
         return {"ok": True, "no_changes": True, "reason": why, "text": text, "loose": loose,
                 "dry_run": bool(req.dry_run), "files": [], "empty": True,
@@ -836,7 +997,7 @@ async def api_world_apply(req: WorldApplyRequest):
                              for f in files], "ts": time.time()}
         _world_state["apply"] = payload
         _world_state["verify"] = None
-        await broadcast(events.event("world", stage="apply", **payload))
+        # 这条不广播: 预览只服务于正在等这份清单的那一个调用方, 广播出去会和它画的卡片重复
         return {"ok": True, "dry_run": True, "message": "", "files": files,
                 "empty": not files, "loose": loose, "applied": [], "skipped": []}
 
@@ -885,20 +1046,32 @@ async def api_world_commit(req: WorldCommitRequest):
 
 @app.post("/api/world/test")
 async def api_world_test(req: WorldTestRequest):
-    """跑一次自测命令(在工作区目录下), 把输出交给前端决定是否回给网页模型。"""
+    """跑一次自测命令(在工作区目录下), 把输出交给前端决定是否回给网页模型。
+
+    占互斥: 这条命令是在工作区里跑的, 和"正在往工作区写东西的那一轮"不能同时发生。
+    """
     eng = settings.load().get("engine") or {}
     cmd = (req.command or eng.get("test_cmd") or "").strip()
     if not cmd:
         return {"ok": True, "skipped": True, "output": "", "code": 0}
+    if not claim("自测命令"):
+        return {"ok": False, "code": -1, "output": _busy_why()}
+    try:
+        return await _run_test_cmd(cmd, req.timeout)
+    finally:
+        await release()
+
+
+async def _run_test_cmd(cmd: str, timeout: float) -> dict:
     cwd = str(workspace.ROOT)
     try:
         proc = await asyncio.create_subprocess_shell(
             cmd, cwd=cwd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT)
         try:
-            out = await asyncio.wait_for(proc.communicate(), timeout=max(5, min(req.timeout, 900)))
+            out = await asyncio.wait_for(proc.communicate(), timeout=max(5, min(timeout, 900)))
         except asyncio.TimeoutError:
             proc.kill()
-            return {"ok": False, "code": -1, "output": f"自测命令超时({int(req.timeout)}s): {cmd}"}
+            return {"ok": False, "code": -1, "output": f"自测命令超时({int(timeout)}s): {cmd}"}
     except Exception as exc:  # noqa: BLE001
         return {"ok": False, "code": -1, "output": f"自测命令无法执行: {exc}"}
     text = _decode_out(out[0] or b"")
@@ -972,6 +1145,31 @@ def _tool_failure(code: int, out: str, cmd: str = "") -> bool:
         return True
     low = (out or "").lower()
     return any(k.lower() in low for k in _TOOL_FAIL)
+
+
+# "shell 退出码是 0, 但它要跑的程序根本没启动"的形状。
+# 只列 PowerShell/CMD **自己的错误记录**, 不放 `_TOOL_FAIL` 里那些裸词("找不到"、"not found"):
+# 程序自己的正常输出里也可能有(测试断言 404 not found、日志里一句 file not found),
+# 那些词只在退出码非 0 时才敢用。
+_NEVER_RAN_RE = re.compile(
+    r"(CommandNotFoundException|TermNotFound|ObjectNotFound:|CategoryInfo\s*:\s*ObjectNotFound|"
+    r"无法将[“\"'][^”\"'\n]{1,60}[”\"']\s*项识别为|is not recognized as the name of a cmdlet|"
+    r"is not recognized as an internal or external command|不是内部或外部命令|"
+    r"command not found|未找到命令|ItemNotFoundException|PathNotFound|"
+    r"Cannot find path|找不到路径)", re.I)
+# `BUILD_EXIT=` 后面什么都没有 = `$LASTEXITCODE` 是 $null = 那条原生命令一次都没跑起来。
+# PowerShell 里 `… ; 'EXIT=' + $LASTEXITCODE` 就是这么把失败藏成退出码 0 的。
+_EMPTY_EXIT_RE = re.compile(r"(?im)^[^\n]{0,40}\b(?:[A-Z_]{2,24}_)?(?:EXITCODE|EXIT)\s*[=:]\s*$")
+
+
+def _never_ran(out: str) -> str:
+    """退出码是 0, 但输出说明程序根本没启动 —— 返回一句为什么("" = 没这个问题)。"""
+    m = _NEVER_RAN_RE.search(out or "")
+    if m:
+        return m.group(0)[:60]
+    if _EMPTY_EXIT_RE.search(out or ""):
+        return "退出码标记是空的($LASTEXITCODE 为 null)"
+    return ""
 
 
 # 只读文件的命令(Get-Content/type/dir…)即使退出码 0 也不产生"证据";
@@ -1118,7 +1316,28 @@ def _evidence_text(obj: dict) -> str:
     return str(ev or "")
 
 
-def _grounding_problems(evidence: str, criteria: str, rounds: list[dict]) -> list[str]:
+def _evidence_quotes(obj: dict) -> list[str] | None:
+    """模型逐条给的"输出原文片段"。返回 None = 它给的是自由文本, 只能靠正则扫。
+
+    为什么不能一律正则扫: 结构化证据渲染出来是 `[1] 命令 <cmd> 输出: "…"`, 里面嵌着**命令本身**,
+    而 PowerShell 命令里全是引号(`$env:SDL_VIDEODRIVER='dummy'`)。扫整段会把命令里的
+    `'dummy'`、`"$env:…"` 当成"引用的输出片段", 于是三条验收点全真的跑通、退出码全 0,
+    也被判成"引用的输出在真实输出里找不到"(2026-09-26 04:33 那次 tetris3d.py 就是这么没过的)。
+    """
+    ev = obj.get("evidence")
+    if not isinstance(ev, list):
+        return None
+    out = []
+    for e in ev:
+        if isinstance(e, dict):
+            q = str(e.get("quote") or e.get("output") or "").strip()
+            if q:
+                out.append(q)
+    return out
+
+
+def _grounding_problems(evidence: str, criteria: str, rounds: list[dict],
+                        quotes: list[str] | None = None) -> list[str]:
     """把"自己写一句证据"钉死在这次真跑过的命令和真实输出上。"""
     clean = re.sub(r'(""|\'\'|「」|『』|“”|``)', "", evidence or "")   # 先去掉空引号
     ev = _norm(clean)
@@ -1130,7 +1349,7 @@ def _grounding_problems(evidence: str, criteria: str, rounds: list[dict]) -> lis
     if not any(_norm(t) in ev for t in tokens if len(t) >= 3):
         problems.append("证据里没有点名这次真跑过的命令(不能拿别处/没跑过的构建当证据)")
     outs = _norm("\n".join(str(r.get("output") or "") for r in ok_runs))
-    for q in _QUOTE_RE.findall(clean):
+    for q in (quotes if quotes is not None else _QUOTE_RE.findall(clean)):
         nq = _norm(q)
         if len(nq) >= 6 and nq not in outs:
             problems.append("证据里引用的输出「" + q[:50] + "」在这次的真实输出里找不到")
@@ -1233,7 +1452,11 @@ async def _run_cmd(cmd: str, timeout: float) -> tuple[int, str]:
 
 @app.post("/api/world/verify")
 async def api_world_verify(req: WorldVerifyRequest):
-    """本地模型自己验证项目: 挑构建/测试命令 -> 看输出 -> 自己改 -> 直到通过。"""
+    """本地模型自己验证项目 —— **立刻返回**, 结论走 WS 的 `world / stage=verdict` 事件。
+
+    以前这 200 行整个跑在请求里: 最多 6 轮、每轮命令最长 300s, 客户端要挂在那里等;
+    中途刷新页面就永久丢了结论(卡片停在"验证中"), 而循环还在后台烧命令。
+    """
     if not (req.task.strip() or req.answer.strip() or req.applied):
         return JSONResponse({"error": "没有可验证的内容"}, status_code=400)
     # 【严格门槛】没有任何落盘改动、回答里也没有代码 = 这次没东西可验证: 别叫本地模型白跑命令。
@@ -1245,6 +1468,35 @@ async def api_world_verify(req: WorldVerifyRequest):
     if not ((pcfg.get("type") in ("api", "local")) and
             (pcfg.get("type") == "local" or pcfg.get("api_key"))):
         return JSONResponse({"error": "需要先配置本地/规划模型"}, status_code=400)
+    if (r := await _claim_or_409("本地验证")) is not None:
+        return r
+    _spawn(_run_verify(req))
+    return {"ok": True, "started": True}
+
+
+async def _run_verify(req: WorldVerifyRequest):
+    """后台跑验证。
+
+    顺序很关键: **先 release 再广播结论** —— 验证不通过时界面会把报错回传给 ChatGPT
+    (POST /api/chat), 锁还握着的话那一发会撞自己的 409。
+    """
+    try:
+        verdict = await _verify_core(req)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("world verify crashed")
+        verdict = {"ok": False, "gave_up": True, "real_error": False, "rounds": [],
+                   "changed": [], "reason": "crash", "checks": "", "local_fixes": 0,
+                   "tried_local_fix": False, "behavior_ok": False, "build_ok": False,
+                   "root": str(workspace.ROOT), "audit": "", "last_command": "",
+                   "last_output": "", "error_log": str(exc)[:4000]}
+    finally:
+        await release()
+    await broadcast(events.event("world", stage="verdict", **verdict))
+
+
+async def _verify_core(req: WorldVerifyRequest) -> dict:
+    """验证主体: 挑构建/测试命令 -> 看输出 -> 自己改 -> 出结论。"""
+    pcfg = settings.load().get("planner", {})     # 重新读一次: 排队期间设置可能被人改过
     repo = (settings.load().get("engine") or {}).get("repo", "")
     applied_txt = "\n".join(f"- {a.get('op')} {a.get('path')}" for a in (req.applied or []))
     rounds: list[dict] = []
@@ -1282,7 +1534,13 @@ async def api_world_verify(req: WorldVerifyRequest):
             ans = await planner.ask(pcfg, prompt)
         except planner.PlannerError as exc:
             _cleanup_verify_dir(verify_dir, verify_dir_existed)
-            return JSONResponse({"error": "本地模型调用失败: " + str(exc)}, status_code=502)
+            return {"ok": False, "gave_up": True, "real_error": False, "rounds": rounds,
+                    "changed": changed, "reason": "planner-error", "checks": criteria,
+                    "local_fixes": local_fixes, "tried_local_fix": bool(local_fixes),
+                    "behavior_ok": behavior_ok, "build_ok": build_ok,
+                    "root": str(workspace.ROOT), "audit": "",
+                    "last_command": last_cmd, "last_output": last_out[-8000:],
+                    "error_log": "本地模型调用失败: " + str(exc)[:4000]}
         obj = engineer.extract_verify(ans or "")
         if obj is None:
             gave_up = True
@@ -1313,6 +1571,7 @@ async def api_world_verify(req: WorldVerifyRequest):
                 # 包装命令的假成功: shell 退出码 0, 真实结果在输出里(用户看到过满屏 ✓ 其实全失败)
                 real = _wrapper_exit_code(out)
                 masked = _masked_failure(out)
+                never = _never_ran(out)
                 if real:
                     code = real
                     out += ("\n\n[这条命令的 shell 退出码是 0, 但它自己在输出里打印的退出码是 " +
@@ -1321,6 +1580,11 @@ async def api_world_verify(req: WorldVerifyRequest):
                     code = 1
                     out += ("\n\n[这条命令的 shell 退出码是 0, 但输出里是构建/测试失败(" + masked +
                             ") —— 按失败算]")
+                elif never:
+                    code = 1
+                    out += ("\n\n[这条命令的 shell 退出码是 0, 但**它要跑的程序根本没启动**(" + never +
+                            ") —— 按失败算。这台机器上没有这个工具, 不是你代码的问题: "
+                            "换一条本机确实存在的命令, 或者在结论里如实写清楚缺什么]")
             note_extra = _wrong_copy_note(cmd) if code != 0 else ""
             if note_extra:
                 out += note_extra          # 写进这条命令的输出里: 提示词、留痕、界面都能看到
@@ -1405,7 +1669,7 @@ async def api_world_verify(req: WorldVerifyRequest):
                 last_cmd, last_out = "", note
                 continue
             # 证据必须落到"这次真跑过的命令 + 真实输出"上; 行为性验收点不能只有编译证据
-            problems = _grounding_problems(ev_txt, criteria, rounds)
+            problems = _grounding_problems(ev_txt, criteria, rounds, _evidence_quotes(obj))
             if not problems and _criteria_need_behavior(criteria) and not behavior_ok:
                 problems.append("验收点是行为性的, 但这次只跑了编译/静态检查" +
                                 ("(qmllint/cmake 之类)" if build_ok else "") +
@@ -1547,7 +1811,7 @@ async def api_start(req: StartRequest | None = None):
     target = providers.get(req.provider)
     if (manager._ctx is not None  # noqa: SLF001
             and manager.provider.id != target.id and manager.busy):
-        return JSONResponse({"error": "正在生成中, 请稍后再切换 Provider"}, status_code=409)
+        return JSONResponse({"error": _busy_why() + "(切换站点会换掉整个浏览器)"}, status_code=409)
     # 已在启动/登录流程且目标一致 -> 幂等返回
     if (manager._ctx is not None  # noqa: SLF001
             and manager.provider.id == target.id):
@@ -1556,8 +1820,18 @@ async def api_start(req: StartRequest | None = None):
             and manager.state in ("launching", "waiting_login")
             and manager.provider.id == target.id):
         return {"ok": True, "state": manager.state}
-    _spawn(manager.ensure_started(target.id))
+    if (r := await _claim_or_409("启动/切换站点")) is not None:
+        return r
+    _spawn(_do_start(target.id))
     return {"ok": True, "state": "launching"}
+
+
+async def _do_start(pid: str):
+    """启动/切换站点也占住互斥: 它会把浏览器整个换掉, 和任何一轮对话都不能同时发生。"""
+    try:
+        await manager.ensure_started(pid)
+    finally:
+        await release()
 
 
 @app.post("/api/chat")
@@ -1567,8 +1841,6 @@ async def api_chat(req: ChatRequest):
     if not await manager.ensure_alive():          # 窗口被关掉时给明确提示, 而不是"找不到输入框"
         return JSONResponse({"error": "桥接浏览器窗口已关闭, 请点左下角「启动并登录」重新打开"},
                             status_code=503)
-    if manager.busy:
-        return JSONResponse({"error": "正在生成中, 请稍候"}, status_code=409)
     if not (req.text.strip() or req.file_ids):
         return JSONResponse({"error": "文本或文件至少提供一项"}, status_code=400)
     files = []
@@ -1576,6 +1848,8 @@ async def api_chat(req: ChatRequest):
         p = _staged_files.pop(fid, None)
         if p:
             files.append(p)
+    if (r := await _claim_or_409("聊天")) is not None:
+        return r
     _spawn(_run_turn(req.text, files))
     return {"ok": True, "state": "queued"}
 
@@ -1619,19 +1893,54 @@ async def api_conversations(more: int = 0):
             "current": manager.conversation_id(), "items": items, "more": bool(more)}
 
 
+class ExportRequest(BaseModel):
+    provider: str = ""          # 空 = 当前连接的站点
+    conv: str = ""              # 空 = 站点当前这段对话
+    save: bool = True           # False = 只拼不写文件(看一眼前置检查)
+
+
+@app.post("/api/transcript/export")
+async def api_transcript_export(req: ExportRequest | None = None):
+    """把这段对话拼成一份 Markdown 存到 `transcripts/exports/`。
+
+    会连着接力链一起导: 这段之前(被它 relay_of 指着的)和之后(relay_of 指着它的)的窗口都进来,
+    窗口之间插那一次换窗口带过去的交接笔记。这就是"换会话之后历史还在不在"的那份答案。
+    """
+    req = req or ExportRequest()
+    pid = req.provider or (manager.provider.id if manager.provider else "")
+    conv = req.conv or str(manager.conversation_id() or "")
+    if not conv:
+        return JSONResponse({"ok": False,
+                             "error": "没有会话 id: 先「启动并登录」并打开一段对话再导出"},
+                            status_code=409)
+    d = transcript.export_markdown(pid, conv)
+    out = {"ok": True, "provider": d["provider"], "conv": d["conv"], "chain": d["chain"],
+           "windows": d["windows"], "messages": d["messages"], "chars": d["chars"],
+           "path": "", "rel": "", "markdown": d["markdown"]}
+    if req.save:
+        p = transcript.save_export(pid, conv, d["markdown"])
+        out["path"] = str(p)
+        out["rel"] = p.relative_to(config.BASE_DIR).as_posix()
+        log.info("导出接力记录: %d 个窗口 %d 条 %d 字 -> %s",
+                 d["windows"], d["messages"], d["chars"], p)
+    return out
+
+
 @app.post("/api/handoff/preview")
-async def api_handoff_preview():
+async def api_handoff_preview(req: HandoffPreviewRequest | None = None):
     """只汇总不发送: 看看"接力上下文"长什么样(排障 / 手动接力用)。
 
+    带 task 就等于手工指定"下一棒要办的事", 笔记和原文片段都按它筛。
     真正的自动接力在站点上下文到上限、自动另开窗口的那一刻做(见 `_handoff_context`)。
     """
     if manager.state != "logged_in":
         return JSONResponse({"ok": False, "error": "浏览器未就绪/未登录"}, status_code=503)
     if not await manager.ensure_alive():
         return JSONResponse({"ok": False, "error": "桥接浏览器窗口已关闭"}, status_code=503)
-    ctx = await _handoff_context(manager)
+    ctx = await _handoff_context(manager, (req.task if req else ""))
     return {"ok": bool(ctx), "chars": len(ctx), "context": ctx,
-            "error": "" if ctx else "没有可汇总的对话, 或者没配「规划模型」"}
+            **{k: v for k, v in _last_handoff.items() if v != ""},
+            "error": "" if ctx else (_last_handoff.get("why") or "没生成出来, 也没记下原因")}
 
 
 @app.get("/api/conversations/messages")
@@ -1645,22 +1954,77 @@ async def api_conversation_messages():
     if not await manager.ensure_alive():
         return JSONResponse({"ok": False, "error": "桥接浏览器窗口已关闭, 请点左下角「启动并登录」重新打开"},
                             status_code=503)
-    return await manager.read_conversation()
+    site = await manager.read_conversation()
+    if site.get("ok"):
+        # 界面都已经付过这次深读的代价了, 顺手把原件存下来
+        try:
+            w = await store_messages(str(site.get("conversation_id") or ""),
+                                     site.get("messages") or [], "site")
+            if w["written"]:
+                log.info("站点对话落盘 %s: 新写 %d 条(跳过 %d)-> %s",
+                         w["conv"], w["written"], w["skipped"], w["path"])
+        except Exception:  # noqa: BLE001
+            log.warning("站点对话落盘失败(不影响本次读取)", exc_info=True)
+    return site
 
 
 @app.post("/api/conversations/open")
 async def api_open_conversation(req: OpenConvRequest):
     if manager.state != "logged_in":
         return JSONResponse({"error": "浏览器未就绪/未登录"}, status_code=503)
-    if manager.busy:
-        return JSONResponse({"error": "正在生成中, 请稍候"}, status_code=409)
     if not await manager.ensure_alive():
         return JSONResponse({"error": "桥接浏览器窗口已关闭, 请点左下角「启动并登录」重新打开"},
                             status_code=503)
-    ok = await manager.open_conversation(req.key, req.url)
+    if (r := await _claim_or_409("切换会话")) is not None:
+        return r
+    try:
+        ok = await manager.open_conversation(req.key, req.url)
+    finally:
+        await release()
     if not ok:
         return JSONResponse({"error": "切换会话失败(站点结构可能已改版)"}, status_code=502)
-    return {"ok": True, "current": manager.conversation_id()}
+    cur = manager.conversation_id()
+    _spawn(_persist_switch_claimed(cur))
+    return {"ok": True, "current": cur}
+
+
+async def _persist_switch(conv: str, wait_s: float = 12.0) -> dict:
+    """切完会话后把这段历史读回放盘 —— 放在后台, 不占用那个"切换"请求的响应。
+
+    只做**浅读**(不滚到顶): 实测冷启动深读他那段 56 条的老会话要 3 分钟以上, 而这段时间
+    互斥是占着的 —— 点一下侧栏就把整个桥锁住几分钟, 比原来卡在请求里还糟。整段滚到顶的
+    代价留给 ⤓ 按钮(那是用户明知要等才点的), 这里只把页面上已经渲染出来的那几条先记下来。
+    """
+    site: dict = {}
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        site = await manager.read_conversation(deep=False)
+        if (site.get("messages") or []) or not site.get("ok"):
+            break
+        await asyncio.sleep(1.2)
+    msgs = site.get("messages") or []
+    if not site.get("ok") or not msgs:
+        await broadcast(events.info_event(
+            "切会话后页面上没读到消息, 本地记录没动 —— 整段要按 ⤓ 深读"))
+        return {"written": 0, "read": 0, "conv": conv}
+    w = await store_messages(conv, msgs, "site")
+    log.info("切到会话 %s: 浅读 %d 条, 新写 %d 条 -> %s",
+             w["conv"], len(msgs), w["written"], w["path"])
+    await broadcast(events.info_event(
+        "已记下页面上已渲染的 %d 条(新写 %d 条); 整段历史要点 ⤓ 滚到顶读" % (len(msgs), w["written"])))
+    return dict(w, read=len(msgs))
+
+
+async def _persist_switch_claimed(conv: str) -> None:
+    if not claim("记下这段会话"):
+        return                                  # 用户已经开始别的动作, 不打扰; ⤓ 随时能补
+    await broadcast(events.status_event(**manager.status()))
+    try:
+        await _persist_switch(conv)
+    except Exception:  # noqa: BLE001
+        log.warning("切会话后落盘失败(不影响切换)", exc_info=True)
+    finally:
+        await release()
 
 
 @app.websocket("/ws")
@@ -1681,6 +2045,12 @@ async def ws_endpoint(ws: WebSocket):
     finally:
         _clients.discard(ws)
 
+
+# 回答里被本地化的图片: 存进 transcripts/media/, 用这条挂出来给界面显示。
+# 只挂 media/ 这一个子目录 —— 同目录下的 *.jsonl 是对话原文, 不顺着这条路暴露出去。
+_media_dir = transcript.ROOT / "media"
+_media_dir.mkdir(parents=True, exist_ok=True)
+app.mount("/transcripts/media", StaticFiles(directory=str(_media_dir)), name="media")
 
 # 静态资源挂载在 API/WS 路由之后: 前面已有的路由优先匹配,
 # 其余路径交给 StaticFiles 提供分离的 index.html + css/app.css + js/app.js

@@ -31,6 +31,13 @@ NORMAL_HTML = """<html><body>
 SELS = ["#prompt-textarea"]
 
 
+class FakeProvider:
+    """`_wait_sendable` / `_composer_text` 要读 provider 的选择器表; 探不到就一律放行。"""
+    name = "Fake"
+    send_selectors = ()
+    composer_selectors = ("#prompt-textarea",)
+
+
 class FakePage:
     def __init__(self, out=None, blocked=None):
         self._out = out
@@ -44,11 +51,17 @@ class FakePage:
     async def _press(self, key):
         self.sent.append("<" + key + ">")
 
+    async def evaluate(self, js, arg=None):
+        # 发送键探不出来 -> `_wait_sendable` 放行(和"认不出这个站点"时的真行为一致);
+        # 读输入框返回空 -> 这条链上"回车后清空了"当成发出去了, 本条测的是拦不拦、不是确认环
+        return ""
+
 
 class FakeManager:
     """只保留 send_text 需要的部分, 用真实的 BrowserManager.send_text。"""
     page = None
     _ctx = None
+    provider = FakeProvider()
 
     def __init__(self, blocked_seq):
         self._blocked = list(blocked_seq)
@@ -75,8 +88,17 @@ class FakeManager:
     async def _composer(self):
         return None                      # 走到这里说明没被拦(测试里当"没有输入框"处理)
 
+    async def _carry_context(self, task: str = ""):
+        return ""                        # 这条量的是"认不认得出站点不让输入", 接力内容不是它的题
+
 
 FakeManager.send_text = B.BrowserManager.send_text
+# send_text 现在会先 `_carry_context` 再 `_send_and_confirm`(回车后确认输入框真的清空了),
+# 这两段是链路的一部分, 桩掉就等于没测
+FakeManager._norm = staticmethod(B.BrowserManager._norm)
+FakeManager._composer_text = B.BrowserManager._composer_text
+FakeManager._wait_sendable = B.BrowserManager._wait_sendable
+FakeManager._send_and_confirm = B.BrowserManager._send_and_confirm
 
 
 class FillManager:
@@ -140,8 +162,10 @@ async def main() -> int:
                 bad.append(f"{name} 没被识别出来")
             if not want and got:
                 bad.append(f"{name} 被误判为不可输入: {got[:60]}")
-            if name == "额度提示" and "上限" not in got:
-                bad.append("没有把站点的原话带回来: " + got[:80])
+            # 判的是"回来的是页面上的**原话**", 不是"必须含'上限'两个字" ——
+            # 页面上有两句额度提示(横幅 + 正文), `_BLOCK_JS` 取先命中的那句, 两句都算原话。
+            if name == "额度提示" and (not got or got not in QUOTA_HTML):
+                bad.append("没有把站点的原话带回来(回来的这句在页面上找不到): " + got[:80])
         await b.close()
 
     # 0) 键盘输入被打断 -> 回读发现不完整 -> 重写(注入) -> 完整了才继续

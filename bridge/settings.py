@@ -22,9 +22,9 @@ CLOUD_HINTS = ("api.deepseek.com", "api.openai.com", "api.anthropic.com",
 DEFAULTS = {
     "engine": {
         "repo": "",          # 远程仓库地址(可选, 会写进给网页模型的提示词)
-        "auto_apply": "1",   # World 模式: ChatGPT 回答后, 用本地模型把改动写入工作区
-        "confirm_apply": "1",  # 落盘前弹确认框(可逐条勾选)
-        "auto_test": "1",    # 落盘后自动跑一次自测命令
+        # World 模式默认**自动落盘**: 回答回来后程序把代码块机械地整理成文件改动直接写,
+        # 结果画在消息下面那张卡上。勾上设置里那个框就回到"先列清单、逐条勾选再写"。
+        "confirm_apply": "0",  # 落盘前弹确认框(可逐条勾选)
         "test_cmd": "",      # 自测命令(在工作区目录下执行), 例如 pytest -q / cmake --build build
     },
     "workspace": {

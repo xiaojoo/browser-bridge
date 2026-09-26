@@ -84,6 +84,9 @@ async def main() -> int:
         await page.wait_for_timeout(800)
         await page.evaluate("() => switchMode('world')")
         await page.wait_for_timeout(300)
+        # 先撑出滚动条: 列表不滚到底的话, 底部那点 padding 量不出真实间隙(会一直是顶对齐的假数)
+        await page.evaluate("""() => { for (let i = 0; i < 14; i++)
+          addUserMsg("第 " + i + " 条输入, 用来把消息列表撑出滚动条。"); }""")
         await page.evaluate(EVENTS)
         await page.wait_for_timeout(500)
         r = await page.evaluate(READ)
@@ -117,6 +120,44 @@ async def main() -> int:
         folded = await page.evaluate("() => document.querySelector('#conv .task-card').classList.contains('folded')")
         if not folded:
             bad.append("点标题没有折叠任务卡片")
+
+        # 最后一块和输入框之间的间隙: 只许是"那块自己的 margin + 输入框上沿那 8px 渐变",
+        # 不许有额外余量(以前 .content 底部写的是 calc(--composer-h + 26px), 实测空 48px)。
+        async def gap_now():
+            await page.evaluate("() => { const w = document.getElementById('convWrap');"
+                                " w.scrollTop = w.scrollHeight; }")
+            await page.wait_for_timeout(250)
+            return await page.evaluate("""() => {
+              const conv = document.getElementById("conv"), wrap = document.getElementById("convWrap");
+              const outer = document.querySelector(".composer-wrap"), inner = document.querySelector(".composer");
+              const last = Array.from(conv.children).filter(e => e.getBoundingClientRect().height > 0).pop();
+              if (!last) return { err: "列表里没有可见的一块" };
+              return { gap: Math.round(inner.getBoundingClientRect().top
+                             - last.getBoundingClientRect().bottom),
+                       margin: Math.round(parseFloat(getComputedStyle(last).marginBottom)),
+                       padTop: Math.round(parseFloat(getComputedStyle(outer).paddingTop)),
+                       scrollable: Math.round(wrap.scrollHeight - wrap.clientHeight),
+                       who: last.className };
+            }""")
+        g = await gap_now()
+        print("最后一块到输入框:", json.dumps(g, ensure_ascii=False))
+        if g.get("err"):
+            bad.append("量不了这个间隙: " + g["err"])
+        elif g["scrollable"] <= 0:
+            bad.append("列表没撑出滚动条, 这条量的不是'滚到底'的那个间隙: scrollable=" + str(g["scrollable"]))
+        elif g["gap"] != g["margin"] + g["padTop"]:
+            bad.append("最后一块(%s)和输入框之间多了余量: 间隙 %spx, 但它自己的 margin %s + 输入框上沿 %s = %s"
+                       % (g["who"], g["gap"], g["margin"], g["padTop"], g["margin"] + g["padTop"]))
+        # 反证: 把旧的 +26px 注回去, 上面这条必须报出来(否则那个 0 不可信)
+        await page.add_style_tag(content=".content{padding:24px 0 calc(var(--composer-h,0px) + 26px)}")
+        old = await gap_now()
+        await page.add_style_tag(content=".content{padding:24px 0 var(--composer-h,0px)}")
+        back = await gap_now()
+        print("注回旧声明:", json.dumps(old, ensure_ascii=False), "| 再改回来:", json.dumps(back, ensure_ascii=False))
+        if not g.get("err") and old.get("gap") == g.get("gap"):
+            bad.append("这把尺子分辨不出来: 注回旧的 +26px 后间隙还是 %spx(没量到那份额外余量)" % old.get("gap"))
+        if not g.get("err") and back.get("gap") != g.get("gap"):
+            bad.append("间隙自己不稳定: 同一份内容两次量到 %s / %s px" % (g.get("gap"), back.get("gap")))
         await browser.close()
 
     if bad:

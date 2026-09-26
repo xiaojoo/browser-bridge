@@ -32,6 +32,9 @@
       <button class="ws-icon" id="convRefresh" title="刷新会话列表">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-3-6.7"/><path d="M21 3v5h-5"/></svg>
       </button>
+      <button class="ws-icon" id="convExport" title="把这段对话导出成一份 Markdown 文件（连着它前后接力出来的窗口一起）">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 3H7a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2V8z"/><path d="M14 3v5h5"/><path d="M9 13h6M9 17h4"/></svg>
+      </button>
     </div>
     <div class="history" id="convList"></div>
     <!-- 工作区: 仅 World 模式显示(切换见 setModeLabel) -->
@@ -107,8 +110,9 @@
         <div class="cnav-list" id="convNavList"></div>
       </div>
     </div>
-    <!-- 悬停某一行时浮在卡片左边的提示气泡(显示这条输入的完整文字; 超出高度截断, 内部不滚) -->
-    <div class="cnav-tip" id="convNavTip" hidden></div>
+    <!-- 悬停某一行时浮在卡片左边的提示气泡(显示这条输入的完整文字; 超出高度截断, 内部不滚)。
+         文字放在内层 .cnav-tip-t 里: 外层带内边距, 裁切线会落在 padding box 底边, 下一行就露半行。 -->
+    <div class="cnav-tip" id="convNavTip" hidden><div class="cnav-tip-t"></div></div>
 
     <div class="welcome" id="welcome">
       <div class="w-hero">
@@ -140,6 +144,10 @@
             <span class="t-icon"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg></span>
             <span>新对话</span>
           </button>
+          <button class="tool" id="btnHandoff" title="换到新窗口时会把什么带过去: 先看一眼交接笔记(要调一次规划模型)">
+            <span class="t-icon"><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h11"/><path d="M10 7l5 5-5 5"/><path d="M19 4v16"/></svg></span>
+            <span>接力预览</span>
+          </button>
           <div class="replypick" id="replyPick">
             <button class="tool replybtn" id="btnReply" aria-haspopup="listbox" aria-expanded="false"
               title="这条消息交给谁回答: 网页模型(走桥接浏览器) 或 只用本地模型(不进 ChatGPT)">
@@ -155,7 +163,8 @@
           </button>
         </div>
       </div>
-      <div class="tip">内容由 AI 生成，请仔细甄别 · 本地桥接 · 仅 127.0.0.1</div>
+      <div class="tip">内容由 AI 生成，请仔细甄别 · 本地桥接 · 仅 127.0.0.1
+        <span id="applyMode" hidden></span></div>
     </div>
   </main>
 
@@ -277,6 +286,57 @@
       <button id="editSend">发送给 AI</button>
       <button class="pri" id="editSave">保存</button>
     </div>
+  </div>
+</div>
+
+
+<!-- 导出对话记录的结果 -->
+<div class="overlay" id="exOverlay">
+  <div class="dialog ex-dialog">
+    <h4>对话记录已导出到本地文件</h4>
+    <div class="dlg-body">
+      <div class="hint2" id="exStat"></div>
+      <div class="ho-stat" id="exChain"></div>
+      <pre class="ex-pre" id="exPre"></pre>
+      <div class="hint2">正文按原样写入、未转义；每条的完整原文以对应的 <code>.jsonl</code> 为准。</div>
+    </div>
+    <div class="dlg-foot">
+      <button id="exClose">关闭</button>
+      <button id="exCopyPath">复制文件路径</button>
+      <button id="exCopyAll">复制全文</button>
+    </div>
+  </div>
+</div>
+
+<!-- 上下文接力预览: 站点上下文到上限换新窗口时, 到底会带过去什么 -->
+<div class="overlay" id="hoOverlay">
+  <div class="dialog ho-dialog">
+    <h4>上下文接力 — 换到新窗口时会带过去什么</h4>
+    <div class="dlg-body">
+      <div class="hint2" id="hoCost">网页那边上下文到上限时会自己换一个新窗口, 那边什么都不记得。
+        这里先生成一份看一眼: 填上「这一棒要办的事」, 笔记和原文片段都按它筛。生成一次要调规划模型。</div>
+      <div class="set-row">
+        <label>下一棒要办的事（留空 = 不带过滤器的通用笔记）</label>
+        <input id="hoTask" placeholder="例如：接着把显卡状态检查做成每周跑一次的脚本" spellcheck="false" />
+      </div>
+      <div class="ho-stat" id="hoStat" hidden></div>
+      <div class="ho-note" id="hoNote" hidden></div>
+      <div class="hint2" id="hoPath" hidden></div>
+    </div>
+    <div class="dlg-foot">
+      <button id="hoClose">关闭</button>
+      <button id="hoCopy" disabled>复制整份</button>
+      <button class="pri" id="hoRun">生成预览</button>
+    </div>
+  </div>
+</div>
+
+<!-- 回答里的图片: 点缩略图在**本页**开弹框看大图 —— 不跳走、不开新标签, 也不把正文撑开 -->
+<div class="overlay" id="imgOverlay">
+  <div class="dialog img-dialog">
+    <h4><span id="imgCap">图片</span><span class="img-size" id="imgSize"></span></h4>
+    <div class="dlg-body"><img id="imgView" alt=""></div>
+    <div class="dlg-foot"><button id="imgClose">关闭</button></div>
   </div>
 </div>
 

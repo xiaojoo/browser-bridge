@@ -3,6 +3,8 @@
 根目录默认是 workspace/, 可以在界面上改成任意本地目录(记在 .bridge_settings.json)。
 """
 import os
+import shutil
+import time
 from pathlib import Path
 
 from . import config, settings
@@ -212,6 +214,26 @@ def write_file(rel: str, content: str) -> dict:
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     return {"ok": True, "path": rel, "size": len(content.encode("utf-8"))}
+
+
+def backup_file(rel: str) -> str:
+    """覆盖之前把原文件另存成 `<path>.bak-<时间戳>`, 返回备份的相对路径(没有原文件则空)。
+
+    只给"程序自动落盘"这条路用 —— 手工在编辑器里存盘不需要, 否则一次调试就在项目里刷出
+    一堆 .bak。以前自动落盘是 `p.write_text` 直接盖, 一次配对错误就把真实文件冲掉了
+    (实测: 276 字节的 frontend/index.html 被 27 字节垃圾覆盖, 只能靠 git 还原)。
+    """
+    p = _abs(rel)
+    if not p.exists() or not p.is_file():
+        return ""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    dst = p.with_name(p.name + ".bak-" + stamp)
+    n = 1
+    while dst.exists():                      # 同一秒内连续覆盖也不能互相盖掉备份
+        dst = p.with_name(p.name + ".bak-%s-%d" % (stamp, n))
+        n += 1
+    shutil.copy2(p, dst)
+    return dst.relative_to(ROOT).as_posix()
 
 
 def delete(rel: str) -> dict:

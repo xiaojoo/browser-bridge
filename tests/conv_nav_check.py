@@ -9,7 +9,10 @@
   3) 鼠标落在框上才展开: 在右轨空白处划过不展开, 离开框就收回;
   4) 两态对比: 右边线不动、框高不变、行距不变、显示的条目一样, 只有宽度变大;
   5) 悬停某一行: 那一行有底色, 并在卡片左边浮出提示气泡 —— 里面是这条输入的**完整**文字,
-     气泡内部不滚(没有滚动条), 太长就按 12 行截断、末尾显示「…」; 鼠标离开就收掉;
+     气泡内部不滚(没有滚动条), 太长就按 12 行截断、末尾显示「…」; **高度必须落在整行边界上**
+     (底部那条内边距带子里不许有任何文字笔画 —— 用像素数的, 不声明值; 改之前的写法在这里
+     会露出 7px 字头, 逐行 0,0,2,100,112,164,126); **只在文字上才弹, 只指着行尾那格小横线不许弹**;
+     鼠标离开就收掉;
   6) active = 主题色文字 + 更长的主题色横线, 正文里对应那条输入的泡泡也亮一圈(两边同步跟滚动走);
   7) 点某一行 -> 滚到那条消息(落点对齐"当前那条"的判定线, 点完高亮就是它自己, 不会跑到上一条);
   8) 一屏放不下时: 不滚动、不出滚动条、不留半行, 改成显示一行「……」, 两态一致, 且当前那条仍可见;
@@ -27,6 +30,57 @@ from playwright.async_api import async_playwright  # noqa: E402
 
 URL = "http://127.0.0.1:8765/"
 ACCENT = "rgb(77, 107, 254)"          # --accent: #4D6BFE
+
+# 底部带子里有没有文字笔画, 只能数像素: Range.getClientRects 报的是**布局行盒**
+# (被裁掉的行也照样报), 用它量"露没露出来"会一直量到假的那个数。
+def png_decode(data: bytes):
+    """解非隔行 8bit PNG -> (w, h, 通道数, 每行 bytes)。只用 zlib/struct, 不引依赖。"""
+    import struct
+    import zlib
+    assert data[:8] == b"\x89PNG\r\n\x1a\n", "不是 PNG"
+    pos, w, h, depth, ctype, idat = 8, 0, 0, 8, 6, b""
+    while pos < len(data):
+        (ln,) = struct.unpack(">I", data[pos:pos + 4])
+        tag, body = data[pos + 4:pos + 8], data[pos + 8:pos + 8 + ln]
+        if tag == b"IHDR":
+            w, h, depth, ctype = struct.unpack(">IIBB", body[:10])
+        elif tag == b"IDAT":
+            idat += body
+        elif tag == b"IEND":
+            break
+        pos += 12 + ln
+    assert depth == 8 and ctype in (0, 2, 4, 6), "只支持 8bit RGB/RGBA: %s/%s" % (depth, ctype)
+    ch = {0: 1, 2: 3, 4: 2, 6: 4}[ctype]
+    raw, stride, bpp = zlib.decompress(idat), w * ch, ch
+    out, prev, p = [], bytearray(stride), 0
+    for _ in range(h):
+        f = raw[p]; p += 1
+        line = bytearray(raw[p:p + stride]); p += stride
+        for i in range(stride):
+            a = line[i - bpp] if i >= bpp else 0
+            b = prev[i]
+            c = prev[i - bpp] if i >= bpp else 0
+            if f == 1:
+                line[i] = (line[i] + a) & 255
+            elif f == 2:
+                line[i] = (line[i] + b) & 255
+            elif f == 3:
+                line[i] = (line[i] + ((a + b) >> 1)) & 255
+            elif f == 4:
+                pa, pb, pc = abs(b - c), abs(a - c), abs(a + b - 2 * c)
+                line[i] = (line[i] + (a if (pa <= pb and pa <= pc) else (b if pb <= pc else c))) & 255
+        out.append(bytes(line))
+        prev = line
+    return w, h, ch, out
+
+
+def bright_rows(png: bytes, band: int, side: int = 14, thr: int = 120):
+    """气泡底部 band 行里每行有多少个亮色(文字)像素 —— 深色底 + #fff 字, 阈值取 120。"""
+    w, h, ch, rows = png_decode(png)
+    return [sum(1 for x in range(side, w - side)
+                if min(rows[y][x * ch], rows[y][x * ch + 1], rows[y][x * ch + 2]) > thr)
+            for y in range(max(0, h - band), h)]
+
 
 STUB = r"""(() => {
   const json = (o) => Promise.resolve(new Response(JSON.stringify(o),
@@ -101,6 +155,12 @@ READ = r"""() => {
   const more = document.getElementById("convNavMore");
   const moreShown = !!more && more.style.display !== "none";
   const marked = Array.from(document.querySelectorAll(".user-row.nav-active"));
+  // 气泡里"装文字/被裁切"的那一层(现在是内层 .cnav-tip-t): 滚动条、line-clamp 都要量它,
+  // 量外层只会读到装饰用的那一套(它本来就不滚、也不截断)。
+  const tipT = () => { const t = document.getElementById("convNavTip");
+    if (!t) return null;
+    return (t.firstElementChild && getComputedStyle(t.firstElementChild).webkitLineClamp !== "none")
+      ? t.firstElementChild : t; };
   return {
     hidden: box.hidden,
     open: box.classList.contains("open"),
@@ -148,12 +208,18 @@ READ = r"""() => {
       if (!t || t.hidden) return null; const r = t.getBoundingClientRect();
       return { l: Math.round(r.left), r: Math.round(r.right), t: Math.round(r.top), b: Math.round(r.bottom),
                w: Math.round(r.width), h: Math.round(r.height) }; })(),
-    tipScrollbarW: (() => { const t = document.getElementById("convNavTip");
-      return t ? t.offsetWidth - t.clientWidth : null; })(),
-    tipScrollbarWidth: (() => { const t = document.getElementById("convNavTip");
-      return t ? getComputedStyle(t).scrollbarWidth : null; })(),
-    tipClamp: (() => { const t = document.getElementById("convNavTip");
-      return t ? getComputedStyle(t).webkitLineClamp : null; })(),
+    tipScrollbarW: (() => { const e = tipT(); return e ? e.offsetWidth - e.clientWidth : null; })(),
+    tipScrollbarWidth: (() => { const e = tipT(); return e ? getComputedStyle(e).scrollbarWidth : null; })(),
+    tipClamp: (() => { const e = tipT(); return e ? getComputedStyle(e).webkitLineClamp : null; })(),
+    // 真正在裁切的那一层(有 line-clamp 的那层)的内边距: 底边有内边距就会露出下一行的字头
+    tipPadBottom: (() => { const t = document.getElementById("convNavTip");
+      return t ? Math.round(parseFloat(getComputedStyle(t).paddingBottom)) : null; })(),
+    tipClipPadBottom: (() => { const t = document.getElementById("convNavTip"), e = tipT();
+      if (!t || !e) return null;
+      return { who: e === t ? "outer" : "inner",
+               padBottom: Math.round(parseFloat(getComputedStyle(e).paddingBottom)),
+               h: Math.round(e.getBoundingClientRect().height),
+               lh: parseFloat(getComputedStyle(e).lineHeight) || 16 }; })(),
     activeVisible: (() => {
       if (!act) return null;
       const t = act.offsetTop - list.scrollTop, b = t + act.offsetHeight;
@@ -304,8 +370,41 @@ async def main() -> int:
         check_fits(opened, "展开态(4 条)", bad)
         compare_states(st, opened, "4 条", bad)
 
+        # 只指着"小横线"不许弹气泡: 收起态整行就是那一格横线, 处理程序挂在行上等于
+        # 指横线也弹出一大块, 把横线左边的正文盖住。气泡只许在**文字**上出现。
+        dash = await page.evaluate("""() => { const d = document.querySelector("#convNavList .cnav-item .cnav-d");
+          const b = d.getBoundingClientRect();
+          return { x: Math.round(b.left + b.width / 2), y: Math.round(b.top + b.height / 2) }; }""")
+        await page.mouse.move(700, 400)
+        await page.wait_for_timeout(400)
+        await page.mouse.move(dash["x"], dash["y"])
+        await page.wait_for_timeout(450)
+        on_dash = await page.evaluate(READ)
+        print("指着小横线:", json.dumps({"tip": on_dash["tipShown"], "open": on_dash["open"]},
+                                      ensure_ascii=False))
+        if on_dash["tipShown"]:
+            bad.append("鼠标只指着小横线也弹了气泡(应该只在文字上弹)")
+        # 反证: 把处理程序挂回整行(= 改之前的写法), 同样指横线就必须弹出来;
+        # 弹不出来说明这个"没弹"是量不出来的假绿。
+        await page.evaluate("""() => document.querySelectorAll("#convNavList .cnav-item").forEach(it => {
+          it.onmouseenter = () => showConvNavTip(it, (it.querySelector(".t") || {}).textContent || ""); });""")
+        await page.mouse.move(700, 400)
+        await page.wait_for_timeout(400)
+        await page.mouse.move(dash["x"], dash["y"])
+        await page.wait_for_timeout(450)
+        old_dash = await page.evaluate(READ)
+        print("  挂回整行(旧写法)指着横线:", json.dumps({"tip": old_dash["tipShown"]}, ensure_ascii=False))
+        if not old_dash["tipShown"]:
+            bad.append("这把尺子分辨不出来: 气泡挂回整行后, 指横线也没弹 -> 上面那个 false 不算数")
+        await page.evaluate("() => buildConvNav()")        # 换回真实绑定
+        await page.mouse.move(700, 400)
+        await page.wait_for_timeout(400)
+
         # 悬停某一行: 那一行有底色; 并且在卡片左边浮出提示气泡(完整输入, 内部不滚)
-        await page.hover("#convNavList .cnav-item[data-mi='2']")
+        # 先落在卡片上展开, 再指到**文字**上(气泡只跟文字; 收起态直接 hover 那一行会落在横线格上)
+        await page.hover("#convNavCard")
+        await page.wait_for_timeout(400)
+        await page.hover("#convNavList .cnav-item[data-mi='2'] .t")
         await page.wait_for_timeout(400)
         tip = await page.evaluate(READ)
         print("悬停气泡:", json.dumps({"shown": tip["tipShown"], "text": tip["tipText"][:36],
@@ -546,6 +645,43 @@ async def main() -> int:
                            json.dumps([big["tipScrollbarW"], big["tipScrollbarWidth"]]))
             if big["tipClamp"] in (None, "none"):
                 bad.append("气泡没有做截断(line-clamp): " + str(big["tipClamp"]))
+            # 高度必须等于整数行: 底部那条内边距带子里不许有任何文字笔画(露半行就是这个样子)
+            clip = big["tipClipPadBottom"] or {}
+            lh = clip.get("lh") or 16
+            if clip.get("who") != "inner" or clip.get("padBottom") != 0:
+                bad.append("还在带内边距的那层上裁切(下一行的字头会露出来): " + json.dumps(clip))
+            if clip.get("h") is not None and abs(clip["h"] / lh - round(clip["h"] / lh)) > 0.01:
+                bad.append("文字层的高度不是整数行: h=%s line-height=%s" % (clip["h"], lh))
+            r = big["tipRect"]
+            pad = big["tipPadBottom"] or 7
+            now = bright_rows(await page.screenshot(clip={"x": r["l"], "y": r["t"],
+                                                          "width": r["w"], "height": r["h"]}), pad)
+            print("  底部 %dpx 内边距带子里的亮色像素/行: %s" % (pad, now))
+            if sum(now):
+                bad.append("气泡底部露出了半行(内边距带子里有文字笔画): " + json.dumps(now))
+            # 这把尺子必须能分辨: 把文字塞回带内边距的那层(= 改之前的写法), 同一套数就得报警
+            await page.evaluate("""() => {
+              const t = document.getElementById("convNavTip");
+              window.__keepTip = t.innerHTML;
+              t.innerHTML = ""; t.textContent = navTipText;
+              t.style.cssText = "max-height:240px;white-space:pre-wrap;word-break:break-word;" +
+                "overflow-wrap:anywhere;display:-webkit-box;-webkit-box-orient:vertical;" +
+                "-webkit-line-clamp:12"; }""")
+            await page.wait_for_timeout(200)
+            r2 = await page.evaluate("""() => { const b = document.getElementById("convNavTip")
+              .getBoundingClientRect();
+              return { l: Math.round(b.left), t: Math.round(b.top),
+                       w: Math.round(b.width), h: Math.round(b.height) }; }""")
+            was = bright_rows(await page.screenshot(clip={"x": r2["l"], "y": r2["t"],
+                                                          "width": r2["w"], "height": r2["h"]}), pad)
+            print("  旧写法(文字直接放带内边距的那层)同一份文字: %s  气泡 %dx%d"
+                  % (was, r2["w"], r2["h"]))
+            await page.evaluate("""() => { const t = document.getElementById("convNavTip");
+              t.style.cssText = ""; t.innerHTML = window.__keepTip; delete window.__keepTip; }""")
+            await page.wait_for_timeout(200)
+            if not sum(was):
+                bad.append("尺子分辨不出来: 旧写法也没量到半行, 这条断言等于没测 —— "
+                           "上面那个 0 不可信: " + json.dumps(was))
         await page.mouse.move(700, 400)
         await page.wait_for_timeout(300)
         gone = await page.evaluate(READ)

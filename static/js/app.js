@@ -407,9 +407,13 @@ async function loadConversations(more) {
       // 现在: **不切画面**, 只提示一句; 真正发消息之前会先把站点切回你正在看的那条
       // (见 send() 里的 alignSiteConversation())。
       const siteConv = j.current;
-      if (freshFlag()) {                          // 刚连接: 站点可能还停在上次那条, 跟着它走
-        state.conversation_id = siteConv;
-        renderHistoryFor(prov, liveConvKey(), null);
+      if (freshFlag()) {
+        // 刚连接: 站点窗口还停在上次那条 —— **不跟它走, 也不画它的记录**。
+        // 这里以前会 state.conversation_id = siteConv + renderHistoryFor(...), 结果就是
+        // 用户要的"每次连接都是干净一屏"被这条刷新打回原样(欢迎页又被上次的首条信息盖掉)。
+        // 真发消息时站点会报回它自己的会话 id, 由 message_start 的 adoptConversation() 归位;
+        // 旧记录也没丢, 侧栏点一下就能看回去(openGroup 会清掉这个标记)。
+        lastSiteConvMismatch = siteConv;
       } else if (lastSiteConvMismatch !== siteConv) {
         lastSiteConvMismatch = siteConv;
         const it = convItems.find(i => i.id === siteConv) || {};
@@ -985,6 +989,44 @@ function shortOf(id) { return (providersById[id] && providersById[id].short) || 
 function modeOf(id) { return (providersById[id] && providersById[id].capture_mode) || ""; }
 function esc(s) { return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;"); }
 
+/* 回答里的图片。capture 已经把远程图抓到本地并改写成 `media/<provider>/<conv>/x.png`
+   (ChatGPT 的 images.openai.com 地址是签名的, 过几天就碎), 所以这里优先放行本地路径。
+   属性值必须自己转义引号: esc() 只转 & < >, 不转引号, 把文本直接塞进 src="..." 会被一个
+   引号跑出去变成事件属性。 */
+function imgTag(alt, src) {
+  const s = String(src || "").trim();
+  if (!/^(https?:\/\/|media\/|\.\/media\/)/i.test(s) || /javascript:/i.test(s))
+    return "[" + esc(String(alt || "图片")) + "]";
+  const local = s.indexOf("media/") === 0 || s.indexOf("./media/") === 0;
+  const url = (local ? "/transcripts/" + s.replace(/^\.\//, "") : s)
+    .replace(/"/g, "%22").replace(/&/g, "&amp;");
+  const a = esc(String(alt || "")).replace(/"/g, "&quot;");
+  return '<img class="md-img" src="' + url + '" alt="' + a + '" loading="lazy">';
+}
+
+/* 点缩略图看大图: 在本页开一个弹框。原来是在原处加 .big 撑开, 那样整列正文会跟着跳,
+   一张竖图能把后面的内容顶出屏幕 —— 看图这件事不该改动正文的布局。 */
+const imgOverlay = $("imgOverlay"), imgView = $("imgView"), imgCap = $("imgCap"), imgSize = $("imgSize");
+function openImageView(im) {
+  imgView.src = im.currentSrc || im.src;
+  imgView.alt = im.alt || "";
+  imgCap.textContent = im.alt || "图片";
+  imgSize.textContent = "";
+  imgOverlay.classList.add("show");
+}
+function closeImageView() { imgOverlay.classList.remove("show"); }   // 不清 src: 清掉会再去请求一次页面地址
+imgView.addEventListener("load", () => {
+  if (imgOverlay.classList.contains("show"))
+    imgSize.textContent = imgView.naturalWidth + " × " + imgView.naturalHeight;
+});
+$("imgClose").onclick = closeImageView;
+imgOverlay.addEventListener("mousedown", (ev) => { if (ev.target === imgOverlay) closeImageView(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeImageView(); });
+document.addEventListener("click", (e) => {
+  const im = e.target.closest("img.md-img");
+  if (im) { openImageView(im); e.preventDefault(); }   // 正文里和接力笔记里的图都走这一条
+});
+
 function renderInline(t) {
   return t
     .replace(/`([^`]+)`/g, "<code>$1</code>")
@@ -997,6 +1039,14 @@ function renderMarkdown(raw) {
   const lines = raw.replace(/\r\n/g, "\n").split("\n");
   const out = [];
   let inCode = false, codeBuf = [];
+  let imgBuf = [];
+  // capture 把每张图单独放一行, 连续的图片行并成一个容器 —— 否则每张各占一段,
+  // 三张图就会竖着排三行(实测就是他截图里那个样子)。
+  const flushImgs = () => {
+    if (!imgBuf.length) return;
+    out.push('<div class="md-imgs">' + imgBuf.join("") + "</div>");
+    imgBuf = [];
+  };
   const flushCode = () => {
     if (!codeBuf.length) return;
     out.push('<pre class="code"><span class="copy">复制</span><span class="save">保存</span>'
@@ -1005,8 +1055,15 @@ function renderMarkdown(raw) {
   };
   for (const line of lines) {
     const m = line.match(/^```(\w*)/);
-    if (m) { flushCode(); inCode = !inCode; continue; }
+    if (m) { flushImgs(); flushCode(); inCode = !inCode; continue; }
     if (inCode) { codeBuf.push(line); continue; }
+    const im = line.match(/^\s*!\[([^\]]*)\]\((\S+)\)\s*$/);
+    if (im) { imgBuf.push(imgTag(im[1], im[2])); continue; }
+    // 混在段落里的 ![..](..) 仍会被下面的链接规则拍平 —— 那是故意的: 不生成 <a href>,
+    // 也就没有 javascript: 的口子
+    if (/^\s*$/.test(line)) continue;      // 空行原来就是 push(""), 对 join("") 没影响;
+                                           // 关键是别拿它冲掉图片行(图与图之间常夹空行)
+    flushImgs();
     if (/^#{1,3}\s/.test(line)) {
       const lvl = line.match(/^#+/)[0].length;
       out.push("<h" + lvl + ">" + renderInline(esc(line.replace(/^#+\s*/, ""))) + "</h" + lvl + ">");
@@ -1017,9 +1074,9 @@ function renderMarkdown(raw) {
     } else if (/^\s*\d+[.)]\s/.test(line)) {
       const num = line.match(/^\s*(\d+)[.)]/)[1];        // 保留序号, 否则整段数字列表会变成无编号行
       out.push("<p>" + num + ". " + renderInline(esc(line.replace(/^\s*\d+[.)]\s*/, ""))) + "</p>");
-    } else if (/^\s*$/.test(line)) { out.push(""); }
-    else { out.push("<p>" + renderInline(esc(line)) + "</p>"); }
+    } else { out.push("<p>" + renderInline(esc(line)) + "</p>"); }
   }
+  flushImgs();
   if (inCode) flushCode();
   return out.join("");
 }
@@ -1133,13 +1190,14 @@ function updateSendState() {
     : (!usable && localOnly ? localReplyLabel + ": 直接由设置里的模型回答, 不需要网页窗口" : "");
 }
 function refreshUi() {
+  hoSyncEnable();                             // 接力预览跟着连接/生成状态置灰, 但按钮不消失
   const target = $("selProvider").value;
   const active = state.provider || target;
   const st = STATE_TEXT[state.state] || state.state;
   const dotCls = state.state === "logged_in" ? "on" : (state.state === "error" ? "err" :
                   (state.state === "launching" || state.state === "waiting_login") ? "warn" : "");
   ["chipDot", "chipDot2"].forEach(id => { const d = $(id); if (d) d.className = "dot " + dotCls; });
-  $("chipState").textContent = st + (state.busy ? " · 生成中" : "");
+  $("chipState").textContent = st + (state.busy ? " · " + (state.busy_reason || "生成中") : "");
   // 底部那行显示的是"选中的站点"(和下拉选择一致); 状态/模式挂到它的悬浮提示
   const nameEl = $("chipName"); if (nameEl) nameEl.textContent = nameOf(target);
   const subEl = $("chipSub");
@@ -1156,8 +1214,9 @@ function refreshUi() {
   }
   const b = $("btnStart");
   $("selProvider").disabled = !!state.busy;
-  if (state.busy) { b.disabled = true; b.textContent = "生成中…"; }
-  else if (state.state === "launching" || state.state === "waiting_login") { b.disabled = true; b.textContent = "启动/登录中…"; }
+  // 启动/切换站点现在也占互斥, 所以先看 state 再看 busy —— 否则登录等待会被显示成"生成中…"
+  if (state.state === "launching" || state.state === "waiting_login") { b.disabled = true; b.textContent = "启动/登录中…"; }
+  else if (state.busy) { b.disabled = true; b.textContent = "生成中…"; }
   else if (state.state === "error") { b.disabled = false; b.textContent = "重试启动 " + nameOf(target); }
   else if (state.state === "logged_in") {
     if (target === state.provider) { b.disabled = true; b.textContent = "✓ " + nameOf(target) + " 已连接"; }
@@ -1244,16 +1303,13 @@ function hideConvNavTip() {
   if (tip) tip.hidden = true;
   navTipItem = null;
 }
-function showConvNavTip(item, text) {
+/* 定位单独拆出来: 卡片宽度过渡要 120ms, 指到"刚露出来的文字"那一刻量到的是动画中间值
+   (实测气泡停在 981, 而卡片左沿最终是 1146 —— 气泡压在卡片上)。所以过渡结束还要再贴一次。 */
+function placeConvNavTip() {
   const tip = $("convNavTip"), box = $("convNav");
-  if (!tip || !item || !box || !item.isConnected) return;
-  navTipItem = item;
-  navTipText = text;
-  tip.textContent = String(text || "");
-  tip.hidden = false;
-  // 贴在卡片左边(不压住卡片); 左边放不下才翻到右边; 竖直方向跟着那一行, 并保证不出屏幕
+  if (!tip || tip.hidden || !box || !navTipItem) return;
   const rail = box.getBoundingClientRect();
-  const row = item.getBoundingClientRect();
+  const row = navTipItem.getBoundingClientRect();
   const tw = tip.offsetWidth, th = tip.offsetHeight;
   let left = rail.left - tw - 12;
   if (left < 8) left = rail.right + 12;
@@ -1261,6 +1317,18 @@ function showConvNavTip(item, text) {
   const top = Math.max(8, Math.min(row.top + row.height / 2 - th / 2, window.innerHeight - th - 8));
   tip.style.left = Math.round(left) + "px";
   tip.style.top = Math.round(top) + "px";
+}
+function showConvNavTip(item, text) {
+  const tip = $("convNavTip"), box = $("convNav");
+  if (!tip || !item || !box || !item.isConnected) return;
+  navTipItem = item;
+  navTipText = text;
+  // 写进内层那一格: 外层带内边距, 文字直接放外层会被裁出半行(见 app.css 的 .cnav-tip 注释)
+  const inner = tip.firstElementChild || tip;
+  inner.textContent = String(text || "");
+  tip.hidden = false;
+  // 贴在卡片左边(不压住卡片); 左边放不下才翻到右边; 竖直方向跟着那一行, 并保证不出屏幕
+  placeConvNavTip();
 }
 /* 跳到某一条: 把那条输入的顶部放到判定线稍上一点的地方(和"当前那条"的判定对齐);
    下面内容不够滚就贴底, 这时"当前那条"按贴底规则算成最后一条。 */
@@ -1406,6 +1474,11 @@ function bindConvNavHover() {
   card.addEventListener("mouseleave", closeConvNav);
   card.addEventListener("focusin", openConvNav);      // 键盘也能展开
   card.addEventListener("focusout", closeConvNav);
+  const box = $("convNav");                           // 宽度过渡结束 -> 气泡重新贴一次
+  // 只认框自己的 width: 里面那些横线(.cnav-d)的过渡会冒泡上来, 别跟着白算
+  if (box) box.addEventListener("transitionend", (e) => {
+    if (e.target === box && e.propertyName === "width") placeConvNavTip();
+  });
 }
 function buildConvNav() {
   const box = $("convNav"), list = $("convNavList");
@@ -1432,7 +1505,9 @@ function buildConvNav() {
     item.appendChild(label);
     item.appendChild(tail);
     item.onclick = () => jumpToMessage(mi);
-    item.onmouseenter = () => showConvNavTip(item, msg.text);
+    // 气泡只跟着**文字**走: 收起态整行就是那一格横线, 挂在行上等于"指横线也弹一大块",
+    // 会把横线左边那些正文盖住。文字在收起态是 display:none, 所以挂它上面天然就不弹。
+    label.onmouseenter = () => showConvNavTip(item, msg.text);
     item.onmouseleave = hideConvNavTip;
     list.appendChild(item);
   }
@@ -1625,6 +1700,13 @@ function dedupeWorldRows(rows) {
   });
 }
 /* 这行是不是已经画过了 —— 同一批结果会从"事件/接口返回值/刷新的状态同步"进来好几遍 */
+function appliedRow(a) {
+  // 两处画同一批结果(WS 事件 + 接口返回值), 文字必须一字不差 —— worldRowExists 是按
+  // 整段文本去重的, 两边写法不一致就会各画一行。
+  return String(a.op || "") + " " + String(a.path || "") +
+    (a.size ? " (" + a.size + "B)" : "") + (a.backup ? " · 已备份" : "");
+}
+
 function worldRowExists(card, text) {
   if (!card || !card.spec) return false;
   const t = String(text || "").slice(0, 300);        // worldRow 存的是截断后的文字
@@ -1921,11 +2003,17 @@ function handleApplyEvent(ev) {
     addWriteAllButton(card, files.length);
     return;
   }
+  if (ev.action === "skipped") {
+    // 自动模式下这条通知是唯一的一份: 必须把"为什么什么都没写"写在卡片上, 不能静默过去
+    setCardFoot(card, ev.text || ("这条回答里没有可写入的文件(" + (ev.reason || "没认出文件改动")
+                                  + ") —— 没有动任何文件"), false);
+    return;
+  }
   if (ev.action === "applied") {
     const applied = ev.applied || [], skipped = ev.skipped || [];
     // 同一批结果会从"事件 + 接口返回值 + 刷新后的状态同步"进来好几遍, 已经画过的不再画
     applied.forEach(a => {
-      const t = a.op + " " + a.path + (a.size ? " (" + a.size + "B)" : "");
+      const t = appliedRow(a);
       if (!worldRowExists(card, t)) worldRow(card, "✓", t, "done");
     });
     skipped.forEach(s => { if (!worldRowExists(card, s)) worldRow(card, "!", s, "err"); });
@@ -1954,6 +2042,7 @@ async function syncWorldState() {
 /* 本地模型验证项目的过程(服务端边跑边推事件) */
 function handleWorldEvent(ev) {
   if (ev.stage === "apply") { handleApplyEvent(ev); return; }
+  if (ev.stage === "verdict") { worldVerdict(ev); return; }   // 后台跑完的结论(以前是 HTTP 返回值)
   if (ev.stage !== "verify") return;
   let existing = cardFor("本地验证");
   if (!existing || (existing.el && !existing.el.isConnected)) {
@@ -2025,6 +2114,45 @@ async function worldAfterAnswer(task, answer) {
   }
 }
 
+/* World 模式下附在你那段话后面的一行格式要求。
+   为什么要有: ChatGPT 会把整份代码装进 Canvas 卡片, 而卡片在消息 DOM 里只留一行标题 +
+   一个运行预览 iframe —— 实测那条"完整代码(一个HTML即可)"的回答只采到 803 字、0 个代码围栏,
+   源码一个字都没进来, 于是本地永远拿不到文件内容。要它直接用围栏写在消息里才采得到。 */
+const WORLD_CODE_ASK =
+  "【输出格式】请把每个文件的完整内容直接写在消息正文里, 用带文件路径的代码围栏" +
+  "(例如 ```index.html 换行后放整份内容, 结尾 ```); 不要用 Canvas / 代码卡片 / 只给运行预览 —— " +
+  "那种形式内容取不到, 我这边没法落盘。";
+
+/* 认不出文件名时给个"重来"的口子: 整理规则可能刚修过, 或者让 ChatGPT 补上文件名后
+   想重试这一条(不用把整段回答再发一遍)。自动模式和确认模式都要有, 所以抽出来。 */
+function addRetryButton(c, task, answer) {
+  const foot = c && c.el ? c.el.querySelector(".task-foot") : null;
+  if (!foot || foot.querySelector(".task-btns")) return;      // 别叠两张一样的按钮
+  const btns = document.createElement("div");
+  btns.className = "task-btns";
+  const again = document.createElement("button");
+  again.textContent = "重新整理这条回答";
+  again.onclick = () => { btns.remove(); worldPipeline(task, answer); };
+  btns.appendChild(again);
+  foot.appendChild(btns);
+}
+
+/* 输入框下面那行的落盘模式指示。读的是设置里同一个 confirm_apply, 不另存一份判断;
+   只在 World 模式出现 —— 只有这个模式会把回答里的代码写进你工作区的文件。
+   没有它的话, "会不会不问我就改文件" 这件事只在设置弹层里看得见, 外面一点征兆都没有。 */
+let applyConfirm = true;
+function paintApplyMode(confirm) {
+  applyConfirm = !!confirm;
+  const el = $("applyMode");
+  if (!el) return;
+  if (currentMode !== "world") { el.hidden = true; return; }
+  el.hidden = false;
+  el.textContent = applyConfirm ? "· 落盘: 先给你勾选" : "· 落盘: 自动写入工作区";
+  el.className = applyConfirm ? "" : "auto";
+  el.title = "World 模式: 回答里整理出来的文件改动会不会不问你就写进工作区。\n" +
+             "改这里: 设置 → 「本地模型落盘前弹确认框」";
+}
+
 /* 网页模型的回答回来后: 把回答里的文件改动**机械地**整理出来 -> 列成卡片 -> 用户决定写不写。
    本地模型不参与这一步(不写代码、也不判断该改什么); 只有"自测"那一步才会用到它(跑命令看输出)。 */
 async function worldPipeline(task, answer) {
@@ -2033,6 +2161,7 @@ async function worldPipeline(task, answer) {
     settings = await (await fetch("/api/settings")).json();
     confirm = !((settings.engine && settings.engine.confirm_apply) === "0");
   } catch (e) {}
+  paintApplyMode(confirm);
   let r = { applied: [], skipped: [] };
   let verify = false;
   let card = null;                                  // 确认模式下=那张勾选卡片, 结果就写在它上面
@@ -2048,17 +2177,10 @@ async function worldPipeline(task, answer) {
       const pv = await post("/api/world/apply",
                             { task: task, text: answer, extra_texts: carry, dry_run: true });
       if (pv.no_changes) {
-        const c = worldCard("本地落盘(从 ChatGPT 的回答里整理文件改动)");
+        // 复用服务端事件可能已经建好的那张卡, 别画第二张
+        const c = cardFor("本地落盘") || worldCard("本地落盘(从 ChatGPT 的回答里整理文件改动)");
         setCardFoot(c, pv.text || "这条回答里没有可写入的文件, 已跳过", false);
-        // 认不出文件名时给个"重来"的口子: 整理规则可能刚修过, 或者让 ChatGPT 补上文件名后
-        // 想重试这一条(不用把整段回答再发一遍)。
-        const btns = document.createElement("div");
-        btns.className = "task-btns";
-        const again = document.createElement("button");
-        again.textContent = "重新整理这条回答";
-        again.onclick = () => { btns.remove(); worldPipeline(task, answer); };
-        btns.appendChild(again);
-        c.el.querySelector(".task-foot").appendChild(btns);
+        addRetryButton(c, task, answer);
         return;
       }
       dropAutoPreviewCard();                        // 同一次整理别画两张卡
@@ -2072,8 +2194,16 @@ async function worldPipeline(task, answer) {
         message: "",
       });
     } else {
-      r = await post("/api/world/apply", { task: task, text: answer });   // 自动写入整理出来的改动
-      if (r.no_changes) return;
+      // 自动模式: 先把卡片建出来, 服务端广播的 apply 事件才会落在同一张卡上
+      // (否则 handleApplyEvent 自己建一张、这里再建一张, 就是"一张空白 + 一张结果")
+      card = worldCard("本地落盘(从 ChatGPT 的回答里整理文件改动)");
+      r = await post("/api/world/apply", { task: task, text: answer });
+      if (r.no_changes) {
+        // 原因就在返回值里, 直接写上 —— 等 WS 事件回传会漏(别的窗口/事件顺序/这一发被拦)
+        setCardFoot(card, r.text || "这条回答里没有可写入的文件, 已跳过", false);
+        addRetryButton(card, task, answer);
+        return;
+      }
       verify = true;
     }
   } catch (e) {
@@ -2085,14 +2215,15 @@ async function worldPipeline(task, answer) {
 
   const applied = r.applied || [], skipped = r.skipped || [];
   if (!applied.length && !skipped.length) return;
-  if (!card) {                                      // 自动模式: 结果卡
-    card = worldCard("本地落盘(从 ChatGPT 的回答里整理文件改动)");
-    applied.forEach(a => {
-      const t = a.op + " " + a.path + (a.size ? " (" + a.size + "B)" : "");
-      if (!worldRowExists(card, t)) worldRow(card, "✓", t, "done");
-    });
-    skipped.forEach(s => { if (!worldRowExists(card, s)) worldRow(card, "!", s, "err"); });
-  }
+  if (!card) card = worldCard("本地落盘(从 ChatGPT 的回答里整理文件改动)");
+  // 文件清单两边都画: 接口返回值 + 服务端广播的 applied 事件。
+  // 只靠一条通道的话, 事件没到(重连/别的窗口/顺序)卡片就只剩一句"应用 N 项"而列不出改了哪几个文件。
+  // worldRowExists 会去重, 所以两边都到也不会重复。
+  applied.forEach(a => {
+    const t = appliedRow(a);
+    if (!worldRowExists(card, t)) worldRow(card, "✓", t, "done");
+  });
+  skipped.forEach(s => { if (!worldRowExists(card, s)) worldRow(card, "!", s, "err"); });
   setCardCount(card, applied.length + " 个文件");
   setCardFoot(card, "应用 " + applied.length + " 项" +
     (skipped.length ? ", 跳过 " + skipped.length + " 项" : ""), false);
@@ -2112,6 +2243,8 @@ const VERIFY_WHY = {
   "no-checks": "它没先定出可判定的验收点(没有判定标准就不算通过)",
   "weak-evidence": "它给的证据对不上真跑过的命令/输出, 或只有编译证据",
   "no-evidence": "它没能跑出任何可当证据的命令(只读文件不算验证)",
+  "planner-error": "本地/规划模型调用失败, 验证没做完",
+  crash: "验证中途异常退出(不是项目报错)",
   "tool-error": "它的命令在这台机器上跑不了",
   "rounds-exhausted": "轮数用完也没拿出证据宣布通过",
   "real-error": "项目里有真实报错",
@@ -2128,8 +2261,11 @@ function verifyWhy(v) {
   return "没能自己完成验证";
 }
 
+let worldVerifyTask = "";         // 结论现在是异步回来的, 回传 ChatGPT 那一步还要用 task
+
 async function worldVerify(task, answer, applied, settings, card, force) {
   worldVerifyCard = null;
+  worldVerifyTask = task || "";
   let v;
   try {
     v = await post("/api/world/verify", {
@@ -2141,8 +2277,39 @@ async function worldVerify(task, answer, applied, settings, card, force) {
     const c0 = worldVerifyCard || worldCard("本地验证(按需求验收点找证据)");
     worldRow(c0, "!", "验证没能执行: " + e.message, "err");
     setCardFoot(c0, "验证没能执行", false);
+    worldBusy = false; refreshUi();     // 一次没跑起来的验证不该把发送永久锁住
     return;
   }
+  if (v && v.started) {                 // 后端转到后台了: 卡片停在"验证中", 结论走 WS verdict
+    const c0 = worldVerifyCard || worldCard("本地验证(按需求验收点找证据)");
+    setCardFoot(c0, "本地模型正在验证(最多 4 轮命令, 每条最长 300 秒)…", true);
+    return;
+  }
+  worldVerdict(v);
+}
+
+/* 把验证跑过的每一轮压成一段文字: 命令 + 退出码 + 输出尾巴。
+   "轮数用完"、"命令在这台机器跑不了" 这类结论没有报错日志可发, 但**过程本身就是最有用的信息**
+   —— 比如"cl / gcc / clang 全部 MISSING"就写在某一轮的输出里, 不发回去它下一轮照旧给 g++ 方案。 */
+function verifyDigest(v) {
+  const rs = (v && v.rounds) || [];
+  if (!rs.length) return "(本地模型这次一条命令都没跑过, 没有过程可看)";
+  const parts = ["本地验证跑过 " + rs.length + " 轮:"];
+  for (const r of rs.slice(-6)) {
+    const out = String(r.output || r.text || "").trim();
+    parts.push("· 第" + (r.round || "?") + "轮 [" + (r.action || "run") + "] 退出码 "
+               + (r.code === undefined ? "?" : r.code) + " —— "
+               + String(r.command || "(没有命令)").slice(0, 220));
+    if (out) parts.push("  输出尾: " + out.slice(-500).replace(/\n/g, " ⏎ "));
+  }
+  return parts.join("\n").slice(0, 6000);
+}
+
+/* 验证结论到手后的分支: 通过就收尾; 不通过(不管是"项目真报错"还是"它自己没搞定")
+   都把结果 + 过程发回 ChatGPT, 最多两轮; 只看本地模型时不回传。
+   原来是 `await post()` 之后的代码, 拆出来只是因为结论不再随请求返回。 */
+async function worldVerdict(v) {
+  const task = worldVerifyTask;
   const vcard = worldVerifyCard || worldCard("本地验证(按需求验收点找证据)");
   // 把"它到底按什么标准判通过"摊开给用户看: 验收点 + 验证的是哪个工作区 + 留痕在哪
   if (v.checks) {
@@ -2165,27 +2332,37 @@ async function worldVerify(task, answer, applied, settings, card, force) {
       (v.behavior_ok ? "" : " · 仅编译/静态检查") + ")", false);
     worldBusy = false; refreshUi(); return;
   }
-  if (!v.real_error) {          // 不是项目报错 —— 具体是哪种情况如实说, 别一律赖"命令跑不了"
-    setCardFoot(vcard, "本地模型没能自己完成验证(不是项目报错: " + verifyWhy(v) + "), 先停在这里", false);
+  const fixes = v.local_fixes || 0;
+  const why = verifyWhy(v);
+  // **只有代码层次的问题才发回 ChatGPT**(v.real_error)。环境/工具链/裁判自己的毛病不发:
+  // 它改不了这台机器 —— 2026-09-26 那次把"这台机器没有 C++ 编译器"发过去毫无意义。
+  // 这类问题由本地这一侧解决: 提示词里已经告诉它"换一条本机确实存在的命令",
+  // 还不行就把缺什么写清楚交给人, 并且**照实说这不是项目报错**。
+  if (!v.real_error) {
+    worldRow(vcard, "!", "验证没做完: " + why + "(不是代码问题, 也不是项目报错)", "err",
+             verifyDigest(v), "查看验证过程");
+    setCardFoot(vcard, "环境/流程问题, 没发给 ChatGPT(它改不了这台机器): " + why, false);
+    worldBusy = false; refreshUi();
     return;
   }
-  // 有真实报错: 本地模型自己修过没有? 没动手就先把话说明白, 别默默甩给网页模型
-  const fixes = v.local_fixes || 0;
   if (!fixes && !v.tried_local_fix) {
     worldRow(vcard, "!", "本地模型一次都没动手改就想交出去 —— 报错留在这里", "err",
              (v.error_log || v.last_output || "").slice(-4000), "查看报错");
     setCardFoot(vcard, "本地模型没动手改, 先停在这里(报错见卡片)", false);
+    worldBusy = false; refreshUi();
     return;
   }
   if (replyTarget() === "local") {      // 只用本地模型: 没有网页模型可回传, 报错就留在卡片里
     worldRow(vcard, "!", "本地模型自己改了 " + fixes + " 次都没修好", "err",
              (v.error_log || v.last_output || "").slice(-4000), "查看报错");
     setCardFoot(vcard, "只看本地模型, 不回传 ChatGPT: 报错留在卡片里, 你可以直接说下一步", false);
+    worldBusy = false; refreshUi();
     return;
   }
   if (worldFixRounds >= 2) {
     worldRow(vcard, "!", "已经交给 ChatGPT 修过 2 轮, 先停在这里", "err");
     setCardFoot(vcard, "先停在这里(需要你自己看看了)", false);
+    worldBusy = false; refreshUi();
     return;
   }
   worldFixRounds++;
@@ -2193,14 +2370,14 @@ async function worldVerify(task, answer, applied, settings, card, force) {
   const logText = (v.error_log || v.last_output || "").trim();
   const changedTxt = (v.changed || []).map(a => a.op + " " + a.path).join(", ");
   let fixMsg = "按你上面的方案, 本地已经改好了" + (changedTxt ? "(" + changedTxt + ")" : "") +
-    ", 但项目验证没通过。请根据下面的报错给出修复方案(需要改的文件请给完整内容)。\n";
+    ", 但项目验证没通过(代码层面的报错, 不是这台机器的环境问题)。请根据下面的报错给出修复方案" +
+    "(需要改的文件请给完整内容)。\n";
   if (v.checks) fixMsg += "\n这次要满足的验收点:\n" + String(v.checks).slice(0, 1500) + "\n";
   if (v.last_command) fixMsg += "最后一次命令: " + v.last_command + "\n";
   if (logText) {
     fixMsg += "\n" + FENCE + "\n" + logText.slice(-6000) + "\n" + FENCE + "\n";
   } else {
-    fixMsg += "\n(本地模型这次没能跑出可用日志: " +
-      ((v.rounds && v.rounds.length) ? JSON.stringify(v.rounds[v.rounds.length - 1]).slice(0, 800) : "无验证记录") + ")\n";
+    fixMsg += "\n(这次没有可用的报错日志, 下面是验证过程: )\n" + verifyDigest(v) + "\n";
   }
   setCardFoot(vcard, "本地模型自己改了 " + fixes + " 次没修好, 才把报错发回 ChatGPT(第 " + worldFixRounds + " 轮)", false);
   addUserMsg("【自测报错 · 第 " + worldFixRounds + " 轮】本地模型没修好, 已把报错发回 ChatGPT");
@@ -2484,6 +2661,7 @@ function setModeLabel() {
   const wsBlock = $("wsBlock");
   if (wsBlock) wsBlock.hidden = currentMode !== "world";
   document.documentElement.classList.toggle("has-workspace", currentMode === "world");
+  paintApplyMode(applyConfirm);          // 切模式时那行指示要跟着走(用缓存值, 不再发请求)
   if (typeof syncScrollbar === "function") syncScrollbar();   // 会话列表/内容区高度可能变了
 }
 function switchMode(m) { currentMode = m; saveMode(m); setModeLabel(); }
@@ -2750,6 +2928,7 @@ async function send() {
   // 先解析"文本模式"文件内容 + 勾选的工作区文件
   const blocks = [];
   if (userText) blocks.push(userText);
+  if (currentMode === "world" && userText && !localOnly) blocks.push(WORLD_CODE_ASK);
   for (const s of textFiles) {
     const c = await readFileText(s.file);
     if (c) blocks.push(c);
@@ -3388,6 +3567,7 @@ $("setSave").onclick = async () => {
                     test_cmd: $("setTestCmd") ? $("setTestCmd").value.trim() : "",
                     confirm_apply: ($("setConfirm") && $("setConfirm").checked) ? "1" : "0" };
     const saved = await post("/api/settings", body);
+    paintApplyMode(body.engine.confirm_apply !== "0");   // 存完外面那行立刻跟着变, 不用等下一次回答
     toast("设置已保存(全局): " + plannerSummary(saved), "info");     // 存完立刻回显"现在用的是哪个模型"
     openSettings();
   } catch (e) { toast("保存失败: " + e.message, "err"); }
@@ -3399,6 +3579,192 @@ $("setClearKey").onclick = async () => {
     openSettings();
   } catch (e) { toast(e.message, "err"); }
 };
+
+/* ================= 上下文接力预览 ================= */
+/* 换窗口本身是自动的(站点拒绝输入时桥会自己开一个新窗口), 这一页只负责"带过去什么"看得见:
+   代价写成一句话, 笔记是模型生成的所以走 renderMarkdown(它逐行 esc), 片段只列清单不内嵌全文。 */
+const hoOverlay = $("hoOverlay");
+let hoLast = null;
+
+const hoFmt = n => (n || 0).toLocaleString("zh-CN");
+
+function hoSyncEnable() {
+  const b = $("btnHandoff");
+  if (!b) return;
+  const ok = state.state === "logged_in" && !state.busy;
+  b.disabled = !ok;
+  b.title = ok
+    ? "换到新窗口时会把什么带过去: 先看一眼交接笔记(要调一次规划模型)"
+    : (state.busy ? "正在生成中, 等这一轮结束再生成接力预览"
+                  : "要先「启动并登录」才能读上一段对话");
+  if (!ok && hoOverlay.classList.contains("show")) closeHandoff("现在不能生成: " + b.title);
+  exSyncEnable();                             // 导出按钮跟同一套状态, 但它还多要一个会话 id
+}
+
+function hoCostSentence(d) {
+  const conv = d.conv_chars || 0, carry = d.carry_chars || 0;
+  const pct = conv ? Math.round(carry * 100 / conv) : 0;
+  return "上一段对话 " + hoFmt(conv) + " 字 / " + d.records + " 条 → 换窗口时带过去 " +
+    hoFmt(carry) + " 字(相当于搬过去 " + pct + "%): 交接笔记 " + hoFmt(d.note_chars) +
+    " 字 + 原文片段 " + d.excerpts + " 条 " + hoFmt(d.excerpt_chars) + " 字。" +
+    "整体硬上限 " + hoFmt(d.carry_max || 20000) + " 字, 超了会截断并在开头写明截断了。";
+}
+
+function hoRow(cls, a, b, tip) {
+  const row = document.createElement("div");
+  row.className = "ho-kv" + (cls ? " " + cls : "");
+  const k = document.createElement("span");
+  k.className = "k";
+  k.textContent = a;
+  const v = document.createElement("b");
+  v.textContent = b;
+  if (tip) v.title = tip;
+  row.append(k, v);
+  return row;
+}
+
+function closeHandoff(msg) {
+  hoOverlay.classList.remove("show");
+  if (msg) toast(msg, "err");
+}
+
+function openHandoff() {
+  hoSyncEnable();
+  const t = $("hoTask");
+  const typing = $("input").value.trim();
+  if (typing && !t.value.trim()) t.value = typing.slice(0, 400);   // 你正在打的这段话就是要办的事
+  hoOverlay.classList.add("show");
+  if (!hoLast) $("hoRun").focus();
+}
+
+async function runHandoff() {
+  const btn = $("hoRun"), note = $("hoNote"), stat = $("hoStat"), pth = $("hoPath");
+  btn.disabled = true;
+  note.hidden = stat.hidden = pth.hidden = false;
+  note.className = "ho-note wait";
+  note.textContent = "正在整理上一段对话… 先把整段滚到顶读回来, 再调一次规划模型 —— "
+                   + "这两段都要时间, 条数越多越久。";
+  stat.textContent = "";
+  try {
+    const d = await post("/api/handoff/preview", { task: $("hoTask").value.trim() });
+    if (!d.ok) {
+      hoLast = null;
+      $("hoCopy").disabled = true;
+      stat.hidden = pth.hidden = true;
+      note.className = "ho-note bad";
+      note.textContent = "没生成出来: " + (d.error || "未知原因");
+      return;
+    }
+    hoLast = d;
+    $("hoCost").textContent = hoCostSentence(d);
+    stat.className = "ho-stat";
+    stat.replaceChildren(
+      hoRow("", "带过去", hoFmt(d.carry_chars) + " 字"),
+      hoRow("", "其中笔记", hoFmt(d.note_chars) + " 字"),
+      hoRow("", "原文片段", d.excerpts + " 条 " + hoFmt(d.excerpt_chars) + " 字"),
+      hoRow(d.rel ? "ok wide" : "bad wide", "逐条记录", d.rel || "这段对话还没落盘",
+            (d.path || "") + "  (相对仓库根目录)"),
+    );
+    const list = document.createElement("div");
+    list.className = "ho-ex";
+    (d.excerpt_list || []).forEach(e => list.append(
+      hoRow("", (e.role === "user" ? "用户" : "助手") + " · " + hoFmt(e.chars) + " 字",
+            e.head || "(空)")));
+    note.className = "ho-note";
+    note.replaceChildren();
+    const md = document.createElement("div");
+    md.className = "assistant-body";          // 笔记走助手气泡那套排版, 不再造一套标题/列表样式
+    md.innerHTML = renderMarkdown(d.note || "");
+    note.append(md);
+    if ((d.excerpt_list || []).length) note.append(list);
+    pth.hidden = false;
+    pth.textContent = "这份笔记只带原文片段里那些; 换窗口之后如果对方问的细节不在里面, " +
+      "完整逐条记录在本机 " + (d.rel || "(未落盘)") + ", 向你要而不是让它猜。";
+    $("hoCopy").disabled = false;
+  } catch (e) {
+    hoLast = null;
+    $("hoCopy").disabled = true;
+    stat.hidden = pth.hidden = true;
+    note.className = "ho-note bad";
+    note.textContent = "请求失败: " + e.message;
+  } finally {
+    btn.disabled = false;
+    hoSyncEnable();
+    btn.disabled = $("btnHandoff").disabled;     // 未登录/生成中时按钮保持置灰
+  }
+}
+
+$("btnHandoff").onclick = openHandoff;
+$("hoClose").onclick = () => closeHandoff("");
+$("hoRun").onclick = runHandoff;
+$("hoCopy").onclick = async () => {
+  if (!hoLast) return;
+  try {
+    await navigator.clipboard.writeText(hoLast.context || "");
+    toast("整份接力文本已复制(" + hoFmt((hoLast.context || "").length) + " 字)", "ok");
+  } catch (e) { toast("复制失败: " + e.message, "err"); }
+};
+$("hoTask").addEventListener("keydown", ev => {
+  if (ev.key === "Enter") { ev.preventDefault(); if (!$("hoRun").disabled) runHandoff(); }
+});
+
+
+/* ================= 导出对话记录 ================= */
+/* 导出走的是"当前这段对话的站点 id", 所以没会话 id 时按钮就是灰的(而不是点了报错)。 */
+const exOverlay = $("exOverlay");
+let exLast = null;
+
+function exSyncEnable() {
+  const b = $("convExport");
+  if (!b) return;
+  const ok = state.state === "logged_in" && !state.busy && !!state.conversation_id;
+  b.disabled = !ok;
+  b.title = ok
+    ? "把这段对话导出成一份 Markdown 文件（连着它前后接力出来的窗口一起）"
+    : (state.busy ? "正在生成中, 等这一轮结束再导出"
+       : (state.state !== "logged_in" ? "要先「启动并登录」才能导出"
+                                      : "这段对话还没有站点会话 id: 先打开一段有内容的会话"));
+}
+
+async function copyText(s, what) {
+  try {
+    await navigator.clipboard.writeText(s || "");
+    toast(what + "已复制", "ok");
+  } catch (e) { toast("复制失败: " + e.message, "err"); }
+}
+
+async function runExport() {
+  const b = $("convExport");
+  if (b.disabled) return;
+  b.disabled = true;
+  try {
+    const d = await post("/api/transcript/export", {});
+    if (!d.ok) { toast("导出失败: " + (d.error || "未知原因"), "err"); return; }
+    exLast = d;
+    $("exStat").textContent = "写到 " + d.rel + " —— 共 " + hoFmt(d.chars) + " 字 / " +
+      hoFmt(d.messages) + " 条消息 / " + d.windows + " 个窗口。";
+    $("exChain").replaceChildren(
+      hoRow("wide", "接力链", d.chain.map(c => c.slice(0, 8)).join(" → ") || d.conv.slice(0, 8),
+            d.chain.join("  →  ")));
+    const md = d.markdown || "";
+    $("exPre").textContent = md.length > 6000
+      ? md.slice(0, 6000) + "\n\n……(预览到 6,000 字, 全文在文件里)" : md;
+    exOverlay.classList.add("show");
+  } catch (e) {
+    toast("导出失败: " + e.message, "err");
+  } finally {
+    hoSyncEnable();
+  }
+}
+
+$("convExport").onclick = runExport;
+$("exClose").onclick = () => exOverlay.classList.remove("show");
+$("exCopyPath").onclick = () => exLast && copyText(exLast.path, "文件路径");
+$("exCopyAll").onclick = () => exLast && copyText(exLast.markdown, "全文 Markdown");
+[hoOverlay, exOverlay].forEach(ov => ov.addEventListener("mousedown", ev => {
+  if (ev.target === ov) ov.classList.remove("show");     // 外点只关遮罩这一层, 不吞掉里面的点击
+}));
+
 
 (async () => {
   try {
@@ -3423,6 +3789,9 @@ $("setClearKey").onclick = async () => {
   loadWorkspace();
   syncWorldState();                      // 把最近一轮落盘/验证结果补画到卡片上
   migrateHistory();                      // v1/v2 老记录 -> v3
+  // 这次连接还是"干净一屏"(刚连上就刷新): 重新立一段本地新会话, 别沿用站点那条的旧分段 ——
+  // 只把画面清空是不够的: 光标还指在旧分段上, 这时发消息会把旧记录整段覆盖掉。
+  if (freshFlag()) showFreshStart();
   // 刷新页面不换工作区目录: 保持服务端当前那个(要换只能由用户主动点会话/选目录)
   syncHistoryView(true);                 // 恢复当前会话的记录(有记录就直接进消息区)
   showWelcome(transcript.length === 0 && !(histConv && histConv !== NEW_CONV));
@@ -3454,6 +3823,11 @@ $("setClearKey").onclick = async () => {
   const rBtn = $("topRefresh");
   if (rBtn) rBtn.onclick = () => refreshAll();
   setModeLabel();
+  // 落盘模式指示要在第一次切到 World 模式之前就拿到真值(否则只会显示默认值)
+  try {
+    const st0 = await (await fetch("/api/settings")).json();
+    paintApplyMode(!((st0.engine && st0.engine.confirm_apply) === "0"));
+  } catch (e) { paintApplyMode(true); }
   // 侧栏收起/展开(按钮 + 视口变窄自动隐藏)
   let sidebarVisible = window.innerWidth > 900;
   function applySidebar() {

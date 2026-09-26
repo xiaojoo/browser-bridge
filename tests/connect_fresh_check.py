@@ -7,6 +7,7 @@
   1) 预置"上次那轮对话"的本地记录, 模拟连接完成 —— 而且让站点那边**仍报着上次那个会话 id**(最坏情况);
   2) 连上之后: 消息区必须是空的(欢迎页), 侧栏里那条会话还在(记录没被破坏);
   3) 刷新页面: 仍然干净(这次连接是干净的, 刷新也不该把它捡回来);
+     而且这时发一条消息, 要落到**新的本地分段** —— 上次的记录不能被覆盖(光清空画面不等于这件事);
   4) 主动点侧栏那条会话: 记录照样能看回去;
   5) 而且全程**不许动用户配的工作区根目录**(这条会话没单独设过工作区时, 一根汗毛都不能动)。
 """
@@ -26,7 +27,8 @@ OLD_MSG = "上次的首条信息"
 STUB = """(() => {
   const json = (o) => Promise.resolve(new Response(JSON.stringify(o),
     { status: 200, headers: { "Content-Type": "application/json" } }));
-  window.__connected = false;
+  // 连接状态要活过刷新: 不然刷新后 /api/status 报未连接, 这条测的就不是"连着的时候刷新页面"
+  window.__connected = sessionStorage.getItem("__wlbstub.conn") === "1";
   const orig = window.fetch.bind(window);
   window.fetch = (u, o) => {
     const s = String(u);
@@ -50,19 +52,22 @@ STUB = """(() => {
   // 模拟"启动并登录"完成: 站点那边仍报着上次那个会话 id
   window.__connect = () => {
     window.__connected = true;
+    sessionStorage.setItem("__wlbstub.conn", "1");
     const sel = document.getElementById("selProvider");
     if (sel) sel.value = "chatgpt";
     state.state = "logged_in"; state.started = true; state.provider = "chatgpt";
     state.conversation_id = "convA"; state.conversation_url = "https://chatgpt.com/c/convA";
     refreshUi();
   };
-  // 预置"上次那轮对话"的本地记录
-  localStorage.setItem("wlb.history.v3", JSON.stringify({ chatgpt: {
-    "convA|s0": { conv: "convA", sid: "s0", ts: Date.now() - 60000, title: "上次那个会话",
-                  url: "https://chatgpt.com/c/convA",
-                  messages: [{ role: "user", text: "上次的首条信息" },
-                             { role: "assistant", text: "上次的回答" }] } } }));
-  localStorage.setItem("wlb.cur.v1", JSON.stringify({ chatgpt: { conv: "convA", sid: "s0" } }));
+  // 预置"上次那轮对话"的本地记录(只在第一次加载时塞, 刷新时别把它复原)
+  if (!localStorage.getItem("wlb.history.v3")) {
+    localStorage.setItem("wlb.history.v3", JSON.stringify({ chatgpt: {
+      "convA|s0": { conv: "convA", sid: "s0", ts: Date.now() - 60000, title: "上次那个会话",
+                    url: "https://chatgpt.com/c/convA",
+                    messages: [{ role: "user", text: "上次的首条信息" },
+                               { role: "assistant", text: "上次的回答" }] } } }));
+    localStorage.setItem("wlb.cur.v1", JSON.stringify({ chatgpt: { conv: "convA", sid: "s0" } }));
+  }
   localStorage.setItem("wlb.provider.v1", "chatgpt");
 })();"""
 
@@ -72,6 +77,8 @@ READ = """() => ({
   titles: Array.from(document.querySelectorAll("#convList .item .nm")).map(e => e.textContent.trim()),
   fresh: sessionStorage.getItem("wlb.fresh.v1"),
   rows: (typeof convRows !== "undefined" && convRows) ? convRows.length : -1,
+  conn: state.state + "|" + (state.conversation_id || "~new"),
+  cursor: JSON.parse(localStorage.getItem("wlb.cur.v1") || "{}").chatgpt || null,
   saved: (() => { try {
     const all = JSON.parse(localStorage.getItem("wlb.history.v3") || "{}");
     const e = ((all.chatgpt || {})["convA|s0"] || {});
@@ -106,7 +113,7 @@ async def main() -> int:
             await page.evaluate("() => window.__connect()")
             await page.wait_for_timeout(1400)          # 等 autoRefreshOnConnect 的定时刷新
             st1 = await page.evaluate(READ)
-            print("刚连上:", json.dumps({k: st1[k] for k in ("welcome", "fresh", "rows", "titles")},
+            print("刚连上:", json.dumps({k: st1[k] for k in ("welcome", "fresh", "rows", "titles", "conn")},
                                         ensure_ascii=False))
             print("  消息区:", json.dumps(st1["msgs"][:80], ensure_ascii=False))
             if OLD_MSG in st1["msgs"]:
@@ -121,13 +128,41 @@ async def main() -> int:
             # 刷新页面: 仍然干净(不该因为刷新又把上次的记录画回来)
             await page.reload(wait_until="networkidle", timeout=30_000)
             await page.wait_for_timeout(900)
+            site = await page.evaluate("""async () => {
+              const s = await (await fetch("/api/status")).json();
+              return s.state + "|" + (s.conversation_id || "~new"); }""")
             st2 = await page.evaluate(READ)
-            print("刷新后:", json.dumps({k: st2[k] for k in ("welcome", "fresh")}, ensure_ascii=False),
-                  "| 消息区:", json.dumps(st2["msgs"][:60], ensure_ascii=False))
+            print("刷新后:", json.dumps({k: st2[k] for k in ("welcome", "fresh", "conn", "cursor")},
+                                        ensure_ascii=False),
+                  "| 消息区:", json.dumps(st2["msgs"][:60], ensure_ascii=False),
+                  "| 站点那边仍报着:", site)
+            if site != "logged_in|convA":
+                bad.append("测试自己的替身没连上(刷新后测的就不是'连着的时候刷新'): " + site)
             if OLD_MSG in st2["msgs"]:
                 bad.append("刷新之后上次会话的首条信息又回来了: " + st2["msgs"][:200])
             if st2["welcome"] != "flex":
                 bad.append("刷新之后不是空白状态: welcome=" + repr(st2["welcome"]))
+
+            # 干净一屏之后发一条: 必须落在**新的本地分段**, 不能把旧记录整段覆盖掉。
+            # (只把画面清空是不够的 —— 光标还指在旧分段 s0 上, 那时写回会盖掉那两条旧消息。)
+            seg = await page.evaluate("""() => {
+              histPush({ role: "user", text: "连接后新发的一条" });
+              const p = ((JSON.parse(localStorage.getItem("wlb.history.v3") || "{}")).chatgpt) || {};
+              const key = liveConvKey() + "|" + curSid;
+              return { conv: liveConvKey(), sid: curSid, key: key,
+                       oldMsgs: ((p["convA|s0"] || {}).messages || []).map(m => m.text),
+                       newMsgs: ((p[key] || {}).messages || []).map(m => m.text) };
+            }""")
+            print("刷新后发一条:", json.dumps({k: seg[k] for k in ("conv", "key", "oldMsgs", "newMsgs")},
+                                             ensure_ascii=False))
+            if OLD_MSG not in " ".join(seg["oldMsgs"]):
+                bad.append("刷新后发一条消息, 把上次那段的记录覆盖掉了: convA|s0 现在只剩 "
+                           + json.dumps(seg["oldMsgs"], ensure_ascii=False))
+            if "连接后新发的一条" not in " ".join(seg["newMsgs"]):
+                bad.append("刷新后发的这条没写进当前分段 " + seg["key"] + ": "
+                           + json.dumps(seg["newMsgs"], ensure_ascii=False))
+            if OLD_MSG in " ".join(seg["newMsgs"]):
+                bad.append("新分段里混进了上次的记录: " + json.dumps(seg["newMsgs"], ensure_ascii=False))
 
             # 主动点侧栏那条会话: 记录还在, 应该能看回去
             await page.evaluate("() => { const r = document.querySelector('#convList .item'); if (r) r.click(); }")

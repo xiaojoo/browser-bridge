@@ -15,6 +15,7 @@ class Provider:
     url: str
     short: str                    # UI 头像/标签缩写
     composer_selectors: tuple = ()   # 依次尝试
+    send_selectors: tuple = ()       # 站点的"发送"键(判断"现在能不能发"), 空 = 认不出就放行
     capture_mode: str = "stream"
     cookie_accept: bool = False   # 是否有"接受全部 Cookie"按钮可点
     new_chat_selectors: tuple = ()   # 优先按选择器点站内"新对话"(比文案匹配稳)
@@ -46,6 +47,10 @@ PROVIDERS: list[Provider] = [
         short="GPT",
         composer_selectors=("#prompt-textarea", "div#prompt-textarea",
                             'div[contenteditable="true"]', "textarea"),
+        send_selectors=('button[data-testid="send-button"]',
+                        'button#composer-submit-button',
+                        'button[aria-label="Send prompt"]',
+                        'button[aria-label*="Send message"]'),
         capture_mode="dom",          # 当前用 DOM 快照; 后续可切 stream
         cookie_accept=False,
         new_chat_selectors=('[data-testid="create-new-chat-button"]',

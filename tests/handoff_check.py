@@ -75,7 +75,7 @@ async def main() -> int:
         m.read_conversation = read_conv
         ctx = await server._handoff_context(m)
         print("接力上下文:\n" + json.dumps(ctx, ensure_ascii=False)[:400])
-        if not ctx.startswith("【上一个窗口的上下文"):
+        if not ctx.startswith("【上一窗口的交接"):
             bad.append("接力上下文没有明确的头: " + ctx[:80])
         if "ScrollBar.AlwaysOn" not in ctx or "Qt 6.5" not in ctx:
             bad.append("汇总结果没有带过来: " + ctx[:200])
@@ -161,13 +161,19 @@ async def main() -> int:
             bad.append("换窗口重试没有成功")
         if len(filled) != 1:
             bad.append("应该只发一条(重试那一条): " + json.dumps(filled, ensure_ascii=False)[:200])
-        elif not (filled[0].startswith("【上一个窗口的上下文") and filled[0].endswith("请继续刚才的改动")):
+        elif not (filled[0].startswith("【上一窗口的交接") and filled[0].endswith("请继续刚才的改动")):
             bad.append("汇总没有拼在新消息前面: " + filled[0][:200])
         if not any("汇总" in t for t in infos):
             bad.append("界面上没有提示「已汇总带过去」: " + json.dumps(infos, ensure_ascii=False)[:200])
-        # 线上那条 manager 必须真的挂上了接力回调(不然功能等于没接)
-        if server.manager.on_context_limit is not server._handoff_context:
-            bad.append("server.manager 没有挂上 on_context_limit 接力回调")
+        # 线上那条 manager 必须真的挂上了接力回调(不然功能等于没接)。
+        # 不比对函数对象: 线上挂的是一层 lambda(它要多传 arm_relay=True), 对象必然不是
+        # _handoff_context 本身。所以查这个回调的函数体里到底调不调 _handoff_context
+        # —— 没挂上、或挂成了别的东西, 都过不了。
+        cb = server.manager.on_context_limit
+        names = getattr(getattr(cb, "__code__", None), "co_names", ())
+        if not (callable(cb) and "_handoff_context" in names):
+            bad.append("server.manager 没有挂上 on_context_limit 接力回调: %r (函数体引用 %s)"
+                       % (cb, names))
     finally:
         server.settings.load, planner.ask, server.broadcast = orig_load, orig_ask, orig_bc
         server._recent_msgs.clear()

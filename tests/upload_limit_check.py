@@ -71,7 +71,8 @@ class StubPage:
         if js is _FILE_INPUTS_JS:
             return [{"accept": a, "disabled": False} for a in self.accepts]
         if js is _ATTACH_DIAG_JS:
-            names = list(arg or [])
+            cfg = arg if isinstance(arg, dict) else {"names": list(arg or [])}
+            names = list(cfg.get("names") or [])
             return {"url": "stub://page", "inputs": self.inputs, "inputsDisabled": 0,
                     "accept": self.accepts[-1] if self.accepts else "",
                     "inputInfo": [], "landed": {n: self.landed for n in names},

@@ -71,8 +71,10 @@ async def main() -> int:
     assert r["hasComposer"] and r["hasSend"] and r["hasSelect"]
     assert r["h1Text"] == "标题", "markdown h1 渲染失败"
     assert r["hasBlockquote"] and r["preBg"], "代码块/引用渲染失败"
-    assert r["bodyFont"] == "14px", f"界面主字体应为 14px: {r['bodyFont']}"
-    assert r["inputFont"] == "14px", f"输入框字号应为 14px: {r['inputFont']}"
+    # 外壳那一套(侧栏/按钮/标题)保持 14px; 对话正文和输入框是照着 ChatGPT 的 computed 值
+    # 定的 16px/26px(2026-09-26 量的), 所以这里判的是"两套字号并存", 不是"全都 14"。
+    assert r["bodyFont"] == "14px", f"外壳主字体应为 14px: {r['bodyFont']}"
+    assert r["inputFont"] == "16px", f"输入框字号应为 16px(跟 ChatGPT 一致): {r['inputFont']}"
     print("SKIN_OK")
     return 0
 

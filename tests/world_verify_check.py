@@ -61,7 +61,7 @@ async def main() -> int:
     server.broadcast = fake_broadcast
     try:
         workspace.use_root(TMP_WS)
-        res = await server.api_world_verify(server.WorldVerifyRequest(
+        res = await server._verify_core(server.WorldVerifyRequest(
             task="修一下 main", answer="把返回值改成 1", applied=[{"op": "update", "path": "main.cpp"}],
             command="", max_rounds=4, timeout=20, force=True))
     finally:
@@ -116,7 +116,7 @@ async def main() -> int:
     planner.ask = fake_ask2
     try:
         workspace.use_root(TMP_WS)
-        r3 = await server.api_world_verify(server.WorldVerifyRequest(
+        r3 = await server._verify_core(server.WorldVerifyRequest(
             task="修 main", answer="改成 2", max_rounds=2, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
@@ -144,7 +144,7 @@ async def main() -> int:
     planner.ask = fake_ask3
     try:
         workspace.use_root(TMP_WS)
-        r4 = await server.api_world_verify(server.WorldVerifyRequest(
+        r4 = await server._verify_core(server.WorldVerifyRequest(
             task="x", answer="y", applied=[], max_rounds=3, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
@@ -164,7 +164,7 @@ async def main() -> int:
     planner.ask = fake_ask4
     try:
         workspace.use_root(TMP_WS)
-        r5 = await server.api_world_verify(server.WorldVerifyRequest(
+        r5 = await server._verify_core(server.WorldVerifyRequest(
             task="x", answer="y", applied=[], max_rounds=1, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
@@ -189,7 +189,7 @@ async def main() -> int:
     planner.ask = fake_danger
     try:
         workspace.use_root(TMP_WS)
-        r2 = await server.api_world_verify(server.WorldVerifyRequest(task="x", answer="y", max_rounds=2,
+        r2 = await server._verify_core(server.WorldVerifyRequest(task="x", answer="y", max_rounds=2,
                                                                    force=True))
     finally:
         planner.ask = orig_ask
@@ -222,7 +222,7 @@ async def main() -> int:
     planner.ask = fake_ask6
     try:
         workspace.use_root(TMP_WS)
-        r6 = await server.api_world_verify(server.WorldVerifyRequest(
+        r6 = await server._verify_core(server.WorldVerifyRequest(
             task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=3, timeout=20,
             force=True))
     finally:
@@ -258,7 +258,7 @@ async def main() -> int:
     planner.ask = fake_ask7
     try:
         workspace.use_root(TMP_WS)
-        r7 = await server.api_world_verify(server.WorldVerifyRequest(
+        r7 = await server._verify_core(server.WorldVerifyRequest(
             task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=3, timeout=20,
             force=True))
     finally:
@@ -292,7 +292,7 @@ async def main() -> int:
     server.broadcast = cap8
     try:
         workspace.use_root(TMP_WS)
-        r8 = await server.api_world_verify(server.WorldVerifyRequest(
+        r8 = await server._verify_core(server.WorldVerifyRequest(
             task="x", answer="y", applied=[], max_rounds=2, timeout=20, force=True))
     finally:
         planner.ask = orig_ask
@@ -314,7 +314,7 @@ async def main() -> int:
         planner.ask = fake
         try:
             workspace.use_root(TMP_WS)
-            r = await server.api_world_verify(server.WorldVerifyRequest(
+            r = await server._verify_core(server.WorldVerifyRequest(
                 task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=rounds, timeout=20,
                 force=True))
         finally:
@@ -432,7 +432,7 @@ async def main() -> int:
     planner.ask = fake_ask8
     try:
         workspace.use_root(TMP_WS)
-        await server.api_world_verify(server.WorldVerifyRequest(task="x", answer="y", max_rounds=1,
+        await server._verify_core(server.WorldVerifyRequest(task="x", answer="y", max_rounds=1,
                                                                timeout=20, force=True))
     finally:
         planner.ask = orig_ask
@@ -501,7 +501,7 @@ async def main() -> int:
     planner.ask = fake_ask9
     try:
         workspace.use_root(TMP_WS)
-        r9 = await server.api_world_verify(server.WorldVerifyRequest(
+        r9 = await server._verify_core(server.WorldVerifyRequest(
             task="给剪贴板历史去重", answer="用 QSet 去重", applied=[], max_rounds=2, timeout=20,
             force=True))
     finally:
@@ -539,7 +539,7 @@ async def main() -> int:
     planner.ask = fake_ask10
     try:
         workspace.use_root(TMP_WS)
-        r10 = await server.api_world_verify(server.WorldVerifyRequest(
+        r10 = await server._verify_core(server.WorldVerifyRequest(
             task="x", answer="y", applied=[], max_rounds=3, timeout=20, force=True))
     finally:
         planner.ask = orig_ask

@@ -316,8 +316,11 @@ async def main() -> int:
             bad.append("回传的消息里没有失败的构建命令: " + str(back)[:300])
         if "EditorArea.qml" not in back:
             bad.append("回传的消息里没说本地改过哪些文件: " + str(back)[:300])
-        if not any("自测报错" in b for b in st["bubbles"]):
-            bad.append("消息列表里没有提示已回传报错: " + json.dumps(st["bubbles"], ensure_ascii=False))
+        # st["bubbles"] 是被 slice(0,24) 过的(那是给打印用的), 判整句要另读一次全文
+        full = await page.evaluate(
+            "() => Array.from(document.querySelectorAll('#conv .user-bubble')).map(e => e.textContent)")
+        if not any("【自测报错 ·" in t and "发回 ChatGPT" in t for t in full):
+            bad.append("消息列表里没有提示已把代码报错发回: " + json.dumps(full, ensure_ascii=False)[:200])
 
         # 场景2: 回答里没认出可写入的文件 -> 不写盘、不弹框、也不去自测(没什么可测的)
         await page.evaluate(r"""() => {
@@ -402,12 +405,17 @@ async def main() -> int:
         st3 = await page.evaluate(r"""() => ({
           calls: window.__calls.map(c => c[0]),
           foots: Array.from(document.querySelectorAll("#conv .task-card .task-foot")).map(e => e.textContent),
+          rows: Array.from(document.querySelectorAll("#conv .task-card .task-item")).map(e => e.textContent),
         })""")
         print("环境问题场景:", json.dumps(st3, ensure_ascii=False)[:300])
+        # 2026-09-26 定下来的分流: **只有代码层次的问题才发回 ChatGPT**。环境/工具链
+        # (命令在这台机器跑不了、缺编译器)由本地这一侧解决, 发给它毫无意义 —— 它改不了这台机器。
         if st3["calls"].count("/api/chat") != 0:
-            bad.append("只是本地命令跑不通时不该回传 ChatGPT: " + json.dumps(st3["calls"], ensure_ascii=False))
-        if not any("不是项目报错" in f for f in st3["foots"]):
-            bad.append("没有如实说明是环境问题: " + json.dumps(st3["foots"], ensure_ascii=False))
+            bad.append("环境/工具链的问题被发给了 ChatGPT: " + json.dumps(st3["calls"], ensure_ascii=False))
+        if not any("没发给 ChatGPT" in f for f in st3["foots"]):
+            bad.append("卡片脚上没写清「这类问题没发出去」: " + json.dumps(st3["foots"], ensure_ascii=False)[:200])
+        if not any("不是代码问题" in r for r in st3["rows"]):
+            bad.append("没如实说明这不是代码问题: " + json.dumps(st3["rows"], ensure_ascii=False)[:250])
 
         # 场景: 只用本地模型 + 验证有真实报错 -> 本地模型自己修不动时也不许回传 ChatGPT
         await page.evaluate(r"""() => {
@@ -552,7 +560,7 @@ async def main() -> int:
         for b in bad:
             print(" -", b)
         return 1
-    print("WORLD_FLOW_OK (原样发消息 -> 回答显示 -> 本地落盘 -> 自测 -> 报错回传)")
+    print("WORLD_FLOW_OK (原样发消息 -> 回答显示 -> 本地落盘 -> 验证 -> 只有代码报错才发回 ChatGPT)")
     return 0
 
 

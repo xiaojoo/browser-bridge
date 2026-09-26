@@ -107,17 +107,38 @@ _FILE_INPUTS_JS = """() => Array.from(document.querySelectorAll('input[type=file
 # 上传**诊断**(只读): 文件到底进没进站点的附件区? 页面上有没有相关提示?
 # set_input_files 不报错 ≠ 站点收下了 —— ChatGPT 被限流时就是"喂进去没反应",
 # 所以必须回读页面: 文件名有没有出现在 DOM 里(附件chip/缩略图的 alt 都算)。
-_ATTACH_DIAG_JS = r"""(names) => {
+#
+# **只在"输入框那张卡片"里找文件名**, 不许扫 document.body: 对话正文/侧栏里也会出现同一个
+# 文件名(GPT 自己复述过它), 那样"没附件"会被判成"附件已落地" —— 于是回车按早了(附件还在传,
+# 站点把发送键按住), 消息就留在输入框里没发出去。
+_ATTACH_DIAG_JS = r"""(cfg) => {
+  const names = (cfg && cfg.names) || [];
   const clean = (s) => String(s || "").replace(/\s+/g, " ").trim();
   const vis = (el) => {
     try { const r = el.getBoundingClientRect(); return r.width > 2 && r.height > 2; }
     catch (e) { return false; }
   };
-  const text = (document.body ? document.body.innerText : "") || "";
-  const html = (document.body ? document.body.innerHTML : "") || "";
+  // 附件区 = 从输入框往上找到"装着 input[type=file] 的那个祖先"(= 输入框那张卡片)
+  let area = null;
+  for (const s of ((cfg && cfg.sels) || [])) {
+    for (const el of document.querySelectorAll(s)) {
+      if (vis(el)) { area = el; break; }
+    }
+    if (area) break;
+  }
+  if (area) {
+    let p = area.closest('form') || area;
+    for (let i = 0; i < 6 && !p.querySelector('input[type=file]') && p.parentElement; i++) {
+      p = p.parentElement;
+    }
+    area = p.querySelector('input[type=file]')
+      ? p : (area.closest('form') || area.parentElement || area);
+  }
+  const text = area ? (area.innerText || "") : "";
+  const html = area ? (area.innerHTML || "") : "";
   const inputs = Array.from(document.querySelectorAll('input[type=file]'));
   const landed = {}, landedHtml = {};
-  for (const n of (names || [])) {
+  for (const n of names) {
     const stem = String(n).replace(/\.[^.]+$/, "").slice(0, 10);   // 站点可能截断长文件名
     landed[n] = !!n && (text.includes(n) || (stem.length >= 4 && text.includes(stem)));
     landedHtml[n] = !!n && (html.includes(n) || (stem.length >= 4 && html.includes(stem)));
@@ -247,6 +268,37 @@ _FILL_JS = """({sels, text}) => {
 
 _FILL_THRESHOLD = 120   # 超过则用注入方式(一次写进去, 不会被页面重绘打断), 否则键盘逐字
 
+# 站点的"发送"键现在能点了吗? —— 这是"能不能发"的**真正前置条件**:
+# 附件还在上传时站点会把发送键按住, 这时候回车是空的(文字留在输入框里)。
+# found=0 表示认不出这个站点的发送键 -> 调用方直接放行, 绝不因为认不出就卡住整轮。
+_SENDABLE_JS = r"""(sels) => {
+  const vis = (el) => {
+    try { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; }
+    catch (e) { return false; }
+  };
+  const bad = (el) => el.disabled === true || el.getAttribute('aria-disabled') === 'true';
+  const pick = (list) => {
+    const out = [];
+    for (const s of list) {
+      for (const el of document.querySelectorAll(s)) {
+        if (vis(el) && !out.includes(el)) out.push(el);
+      }
+    }
+    return out;
+  };
+  // ① Provider 明确点名的发送键; ② 认不出时才用通用兜底(提交按钮 / 带"发送"文案的按钮)
+  let cands = pick((sels || []).filter(Boolean));
+  if (!cands.length) {
+    cands = pick(['button[type="submit"]', 'button[aria-label]', '[role="button"][aria-label]'])
+      .filter(el => {
+        if (el.getAttribute('type') === 'submit') return true;
+        return /send|发送|提交/i.test(String(el.getAttribute('aria-label') || ''));
+      });
+  }
+  if (!cands.length) return { found: 0, enabled: 0 };
+  return { found: cands.length, enabled: cands.filter(el => !bad(el)).length };
+}"""
+
 
 class BrowserManager:
     """单例。状态机: idle -> launching -> waiting_login -> logged_in / error。"""
@@ -259,8 +311,9 @@ class BrowserManager:
         self.state = "idle"          # idle|launching|waiting_login|logged_in|error
         self.last_error = None
         self.busy = False
+        self.busy_reason = ""       # 谁占着互斥(聊天/工程任务/本地验证…), 给 409 和界面用
         self.on_change = None        # async 回调, 状态变化时触发(用于广播)
-        self.on_context_limit = None  # async 回调 (manager) -> str: 换窗口前汇总上一段对话
+        self.on_context_limit = None  # async 回调 (manager, 下一棒要办的事) -> str: 换窗口前汇总上一段
 
     # ---------- 状态 ----------
     def status(self) -> dict:
@@ -269,6 +322,7 @@ class BrowserManager:
             "state": self.state,
             "error": self.last_error,
             "busy": self.busy,
+            "busy_reason": self.busy_reason,
             "started": self._ctx is not None,
             "conversation_id": self.conversation_id(),
             "conversation_url": self.conversation_url(),
@@ -487,17 +541,18 @@ class BrowserManager:
             log.warning("open_fresh_window failed: %s", exc)
             return False
 
-    async def _carry_context(self) -> str:
+    async def _carry_context(self, task: str = "") -> str:
         """换窗口前, 让上层(server)把当前对话汇总成"接力上下文"。
 
         站点上下文到上限时, 新窗口是**空白**的 —— 直接把原话重发一遍, 网页模型就"失忆"了。
         这里先把上一段汇总出来, 由调用方拼在新消息前面带过去。
+        task = 这一棒正要办的事: 交接笔记按它来筛, 只带这件事用得到的部分。
         """
         cb = self.on_context_limit
         if not cb:
             return ""
         try:
-            text = await cb(self) or ""
+            text = await cb(self, task) or ""
         except Exception as exc:  # noqa: BLE001
             log.warning("上下文接力失败(不影响继续发送): %s", exc)
             return ""
@@ -520,7 +575,7 @@ class BrowserManager:
         if reason:
             log.warning("站点不可输入: %s", reason)
             if allow_retry:
-                carry = await self._carry_context()          # 必须在换窗口**之前**读上一段
+                carry = await self._carry_context(text)      # 必须在换窗口**之前**读上一段
                 await self._notify(info=info_event(
                     "站点提示暂时不能输入(" + reason[:80] + "), 已自动另开一个窗口继续" +
                     ("; 上一段的上下文已由本地模型汇总(" + str(len(carry)) + " 字)一起带过去。"
@@ -536,7 +591,7 @@ class BrowserManager:
             if allow_retry:                     # 输入框都找不到, 也可能是被限流页挡住了
                 reason2 = await self.blocked_reason()
                 if reason2:
-                    carry2 = await self._carry_context()
+                    carry2 = await self._carry_context(text)
                     await self._notify(info=info_event(
                         "站点提示暂时不能输入(" + reason2[:80] + "), 已自动另开一个窗口继续" +
                         ("; 上一段的上下文已由本地模型汇总一起带过去。" if carry2 else "。")))
@@ -554,19 +609,65 @@ class BrowserManager:
                     log.info("发送纯文件消息前清掉了输入框里的残留草稿")
                 else:
                     log.warning("输入框里有残留草稿但没清掉, 可能连同文件一起发出去")
-        await self.page.keyboard.press("Enter")
         if text:
+            await self._send_and_confirm(text)
+        else:
+            # 纯文件消息: 一样要先等发送键可点(附件没传完时回车同样是空的)
+            await self._wait_sendable()
+            await self.page.keyboard.press("Enter")
+        return True
+
+    async def _wait_sendable(self, timeout: float = 60.0) -> bool:
+        """等站点的"发送"键变成可点 = 附件传完了/站点肯收这次提交。
+
+        认不出发送键(found=0)或探测失败时**直接放行**: 宁可按老办法试,
+        也不要因为认不出按钮就把整轮卡在这里。
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        sels = [s for s in (getattr(self.provider, "send_selectors", ()) or ()) if s]
+        logged = False
+        while True:
+            try:
+                r = await self.page.evaluate(_SENDABLE_JS, sels) or {}
+            except Exception:  # noqa: BLE001
+                return True                      # 探测不了: 不拦
+            if not r.get("found"):
+                return True                      # 认不出这个站点的发送键: 不拦
+            if r.get("enabled"):
+                return True
+            if not logged:
+                log.info("发送键还不可点(附件可能还在上传), 等它变可点…")
+                logged = True
+            if loop.time() >= deadline:
+                log.warning("等了 %ds 发送键仍不可点(附件还在传?), 还是试着回车", int(timeout))
+                return False
+            await asyncio.sleep(0.4)
+
+    async def _send_and_confirm(self, text: str) -> bool:
+        """回车提交, 并**确认真的发出去了**。
+
+        站点(尤其附件还在上传时)会把"发送"键按住, 这时候回车是空的 —— 曾经发生过:
+        文字留在输入框里、整轮白等 25 秒, 还报成"未捕获到任何内容"。
+        所以: 回车前先等发送键可点; 回车后输入框没被清空就再回车(最多 3 次)。
+        注意: 三次都没清空也**不报错**(怕把已经发出去的误判成失败, 整轮就断了),
+        只广播一条提示 —— 让界面知道"这段话可能没发出去", 而不是假装成功。
+        """
+        want = self._norm(text)
+        for attempt in (1, 2, 3):
+            await self._wait_sendable(timeout=60.0 if attempt == 1 else 15.0)
+            await self.page.keyboard.press("Enter")
             # 站点(SPA)清空输入框有快有慢: 轮询等一会儿, 清空了就算发出去。
-            # 注意: 只记日志, 不报错 —— 曾经因为这里误判, 把已经发出去的消息当成失败,
-            # 结果整轮直接中断、网页模型的回答一条都收不到。
-            want = self._norm(text)
-            for _ in range(10):                      # 最多等 ~5s
+            for _ in range(6):                   # 每次最多等 ~3s
                 await asyncio.sleep(0.5)
                 left = self._norm(await self._composer_text())
                 if not left or left != want:
                     return True
-            log.warning("发送后输入框里仍有同样内容(站点可能还没提交), 继续等模型回复")
-        return True
+            log.warning("第 %d 次回车后输入框仍留着这段话(附件可能还在上传), 重试…", attempt)
+        await self._notify(info=info_event(
+            "这段话没能发出去: 输入框里还留着它 —— 站点可能还在上传附件, 或没接受这次提交。"
+            "请看一眼浏览器窗口再决定要不要重发(否则下一次回车会把它和后面的内容一起发出去)。"))
+        return False
 
     async def clear_composer(self) -> bool:
         """清空输入框里残留的内容(站点还原的草稿 / 上次没发出去的半截话)。
@@ -713,7 +814,9 @@ class BrowserManager:
         if not self.page_alive():
             return {"error": "浏览器窗口不可用"}
         try:
-            out = await self.page.evaluate(_ATTACH_DIAG_JS, list(names or []))
+            out = await self.page.evaluate(_ATTACH_DIAG_JS,
+                                           {"names": list(names or []),
+                                            "sels": list(self.provider.composer_selectors)})
         except Exception as exc:  # noqa: BLE001
             return {"error": str(exc)}
         return out if isinstance(out, dict) else {"error": "诊断脚本返回异常"}

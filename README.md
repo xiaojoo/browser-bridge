@@ -26,14 +26,26 @@ browser-bridge/
 ├── main.py              # 入口: python main.py
 ├── requirements.txt
 ├── profile/<id>/        # 运行时生成: 每 Provider 独立 Chrome 登录态(勿入库)
+├── transcripts/         # 运行时生成(已 .gitignore): 对话原文 JSONL + 抓下来的图片 + 导出
+│   ├── <provider>/<站点会话id>.jsonl
+│   ├── media/<provider>/<会话id>/*.jpg
+│   └── exports/*.md
 ├── static/index.html    # 本地聊天 UI(纯前端, 零构建, 可切换 Provider)
 └── bridge/
     ├── config.py        # 端口/路径/超时
     ├── providers.py     # Provider 注册表(deepseek / chatgpt)
     ├── events.py        # 协议事件(message_start/delta/message_end/...)
     ├── browser.py       # 浏览器管理: 启动/切换/登录等待/发消息/新建对话
-    ├── capture.py       # fetch 流式捕获(stream 模式) + DOM 快照(dom 模式/兜底)
-    └── server.py        # FastAPI + WebSocket 广播
+    ├── capture.py       # fetch 流式捕获(stream 模式) + DOM 快照(dom 模式/兜底) + DOM→Markdown
+    ├── transcript.py    # 对话原文落盘(append-only JSONL) + 接力笔记 + Markdown 导出
+    ├── media.py         # 回答里的远程图片抓到本地(签名地址会过期)
+    ├── history.py       # 界面消息列表的本地记录(localStorage 那一份)读写
+    ├── workspace.py     # 工作区读写 + 覆盖前备份
+    ├── engineer.py      # 把 ChatGPT 回答里的代码块对上文件(不写代码, 只整理)
+    ├── file_operator.py # 工作区文件的增删改查辅助
+    ├── planner.py       # 规划/汇总模型(本地 ollama 或 OpenAI 兼容 API)
+    ├── settings.py      # 设置项与默认值(.bridge_settings.json)
+    └── server.py        # FastAPI + WebSocket 广播 + 互斥(claim/release) + 验证循环
 ```
 
 ## 快速开始(Windows)
@@ -58,12 +70,31 @@ python main.py
 
 | type | 字段 | 说明 |
 |---|---|---|
-| `status` | state/busy/error | 浏览器与任务状态 |
+| `status` | state/busy/busy_reason/error | 浏览器与任务状态；`busy_reason` 是"正被什么占着"(发送中/切会话/后台读回/启动)，409 和界面提示都读它 |
 | `info` | text | 提示(如"请登录") |
 | `message_start` | message_id | 一轮开始 |
 | `delta` | kind=`text`\|`reasoning`, text, snapshot | 实时增量; snapshot=true 为整段替换(兜底模式) |
 | `message_end` | truncated | 一轮结束 |
 | `error` | text | 失败原因 |
+| `world` | stage=`preview`\|`applied`\|`skipped`\|`verify`\|`verdict`\|`finished` | World 模式的过程与结论；`verdict` 带 `ok/reason/checks/root/audit/rounds/real_error/local_fixes`，前端按它决定"发不发回 ChatGPT" |
+
+## 跑自检
+
+`tests/` 下 80 个 `*_check.py` / `*_test.py`，一条命令扫一遍：
+
+```bash
+for t in tests/*_check.py tests/*_test.py; do
+  PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe "$t" >/dev/null 2>&1 || echo "FAIL $t"
+done
+```
+
+- **必须用 `.venv` 里那个 python**(只有它装了 playwright)，系统 python 会 `ModuleNotFoundError`；
+- **必须带 `PYTHONIOENCODING=utf-8`**，否则门禁 `print` 中文/图标会 `UnicodeEncodeError`，
+  把一条其实是绿的门禁报成 FAIL；
+- 需要真站点的几条(`switch_lock_check` / `handoff_ui_check` / `conv_*` / `media_render_check`)
+  要 8765 起着且已登录；没登录时它们会打印 `SKIP` 并退出 0，**别把 SKIP 当量过了**；
+- 另有几条(`gpt_*` / `probe_*` / `live_engineer_check` / `full_path_test`)会**真的往站点发一轮**
+  (在你账号里留下对话)，不是随手跑的回归，跑之前看清它们在做什么。
 
 ## 回复来源: 网页模型 / 只用本地模型
 
@@ -233,6 +264,24 @@ python main.py
   外加 `.verify/` 脚手架拷贝)：`.verify/` 仍会清掉，但事后**可复核**它到底跑过什么。
 - 界面把"验收点 / 验证的工作区 / 证据留痕路径"都摊在验证卡片上；ChatGPT 回答里没有代码时，落盘卡片
   会明说"这些改动由本地模型自己编写"。
+- **"程序根本没启动"不算成功**：PowerShell 里 `… ; 'EXIT=' + $LASTEXITCODE` 这种包装，命令不存在时
+  打印的是空 `EXIT=`，而整条复合命令的 shell 退出码仍是 **0**。所以现在退出码 0 时还要扫
+  `无法将"X"项识别为…` / `CommandNotFoundException` / `PathNotFound` 这些 shell 自己的错误记录，
+  命中就按失败算并标 `tool-error`，同时明说"这是这台机器缺工具，不是你代码的问题"——
+  不许拿它当行为证据(`kind=behavior`)，也不许算成项目报错。回归 `tests/tool_fail_check.py`。
+- **验证结论的分流：只有代码层次的报错才发回 ChatGPT。** 落盘在验证**之前**，验证失败不回滚也不拦落盘。
+  环境/工具链问题(命令在这台机器跑不了、缺编译器)、以及"轮数用完/没给出证据"这类裁判自己的毛病
+  **不发过去**——它改不了这台机器；卡片上写清三件事：这不是代码问题、没发给 ChatGPT、以及过程
+  (哪条命令、什么回显)。代码真报错且本地模型自己动过手才发回(最多两轮；"只看本地模型"时不发)。
+  回归 `tests/verify_sendback_check.py`(六个场景) + `tests/world_flow_check.py` 的"环境问题场景"。
+- 证据核对**不拿正则从自己渲染的文本里再扫一遍**：结构化证据直接取它自己的 `quote` 字段。
+  以前会把命令里的 `$env:SDL_VIDEODRIVER='dummy'` 当成"模型引用的输出片段"，于是三条验收点
+  全真跑通、退出码全 0，也被判成 `weak-evidence`。回归 `tests/evidence_ground_check.py`。
+
+**落点(回答里只写裸文件名时)**
+- 一个名字在工作区里对上**多个同名文件 → 每个都写**(2026-09-26 定稿；中间那版"拦下来问完整路径"已作废)。
+  每个落点写之前各自备份 `.bak-<时间戳>`，卡片上是一行一个完整路径 + 「已备份」。
+  安全边界从"拒绝写"挪到"可回滚 + 看得见"。回归 `tests/fence_target_check.py` 第 3 段。
 
 **测试**
 - `tests/` 里任何落盘都必须先 `workspace.use_root(临时目录)`：以前 `world_flow_check.py` 漏了这一步，
@@ -275,8 +324,15 @@ planner 调用失败会自动回退到网页 Provider 并提示。UI 提供「�
   (URL 里带着会话 id, ChatGPT/DeepSeek 打开首页时会这样), 就主动点一次「新对话」切到新会话页;
   SPA 还没渲染出按钮时再重试一次, 失败也不影响连接本身。
 - **本页这一侧**(`app.js: showFreshStart()`): 只有"本页里先见过未连接、之后才连上"才算一次新连接
-  (打开页面时本来就连着 = 刷新恢复现状, **不会**清屏); 这时清空消息区、从新会话开始,
-  并把标记写进 `sessionStorage`, 所以紧接着刷新页面也还是干净的一屏。
+  (聊过之后的普通刷新 = 恢复现状, **不会**清屏); 这时清空消息区、从新会话开始, 并把标记写进
+  `sessionStorage`。标记还在时**刷新页面会重走一遍同样的步骤**(启动时 `freshFlag()` 为真就再
+  `showFreshStart()` 一次) —— 这点是必须的: 只把画面清空、却不重立本地分段的话, 光标仍指在上次
+  那个分段上, 刷新后发一条消息就会**整段覆盖**上次的记录(实测覆盖前: `convA|s0` 剩 1 条新的、
+  旧的 2 条没了; 修后: 旧的 2 条原样在, 新的落在 `~new|<新 sid>`)。
+- **不跟着站点走**: 站点还停在上次那条时, `/api/conversations` 会报出那个会话 id。刚连接的情况下
+  界面**只把它列进侧栏, 不画它的记录**(以前的分支是"跟着它走 + `renderHistoryFor`", 于是刚清空的
+  一屏又被上次的首条信息盖回来)。真发消息时站点报回它自己的会话 id, 由 `adoptConversation()`
+  把 `~new` 这一段挪过去。
 - **旧记录一条都不动**: 侧栏里照样列着历史会话, 主动点一下就能看回去(那时才恢复正常显示)。
 - **不碰你的工作区**: 连接/新会话/切会话都不会把工作区目录换掉(没有单独设置过的会话沿用当前目录)。
 
@@ -308,15 +364,54 @@ INFO    页面已更换(另开窗口), 捕获切换到新页面
 
 1. 把当前这段对话读回来(`GET /api/conversations/messages` 那套; 站点读不回来就用
    "最近几轮桥发出去的消息"兜底);
-2. 丢给**本地/规划模型**汇总(提示词只让它"提取主要内容、留住结论/进度/待办/具体细节",
-   不写代码、不评价), 超长对话按"留头 + 留尾、中间省略"截到 60000 字;
-3. 汇总结果(带"上一个窗口的上下文…"头尾)拼在**新窗口第一条消息**前面一起发过去, 界面上
-   会提示"上一段的上下文已由本地模型汇总(N 字)一起带过去"。
+2. **先把原件逐条落盘**(`transcript.append`), 再丢给**本地/规划模型**汇总(提示词只让它
+   "提取主要内容、留住结论/进度/待办/具体细节", 不写代码、不评价), 超长对话按"留头 + 留尾、
+   中间省略"截到 60000 字;
+3. 笔记之外再按"这一棒要办的事"从落盘那份**捞几条原文**一起带过去(笔记只有一千多字,
+   报错原文/参数/路径这类东西装不下; 给网页模型一个本地路径它读不了, 所以带的是原文本身);
+4. 汇总结果(以「上一窗口的交接: …」开头)拼在**新窗口第一条消息**前面一起发过去, 界面上
+   会提示"上一段的上下文已由本地模型汇总(N 字)一起带过去";
+5. 卡片上写明**完整逐条记录在本机哪个 `.jsonl`** —— 缺细节去 grep 原件, 不指望摘要恰好留了。
 
 - 没配「规划模型」时不会硬编: 提示"没法把上一段汇总带过去(设置里选本地模型或填 API Key 就能自动接力)"。
-- 想先看看汇总长什么样: `POST /api/handoff/preview`(只汇总不发送)。
+- **界面上怎么看**: 输入框下面那排点「**接力预览**」(`#btnHandoff`)开弹框 —— 它只汇总不发送,
+  列清楚"带过去多少字 / 其中笔记多少字 / 原文片段几条 / 逐条记录在哪个文件", 以及"这次要办的事"
+  输入框(留空 = 不带过滤器的通用笔记)。**预览不会武装接力**: 只有真换窗口时才写 `relay_of`,
+  否则点一次预览之后打开的任何一段不相干旧对话都会被记成"预览那段的下游", 接力链就成了假的。
+- 原文片段的预算是**线性旋钮**: 每 1000 字大约能筛进 4~6 条(实测一段 117,589 字的对话有 1063 条
+  候选, 只带笔记时留 17 条), 上限 `carry_max` 默认 20000 字, 超了截断并在开头写明截断了。
 - 本地模型在这里仍然**只做汇总**, 不改文件、不写代码。
-- 回归: `tests/handoff_check.py`(汇总内容/超长截断/兜底/没配模型/换窗口时拼在消息前面)。
+- 回归: `tests/handoff_check.py`(汇总内容/超长截断/兜底/没配模型/换窗口时拼在消息前面)、
+  `tests/handoff_ui_check.py`(弹框固定高/只有正文滚/任务预填/笔记按 markdown 渲染且无可执行入口)、
+  `tests/transcript_excerpt_check.py`(按"这一棒要办的事"筛原文)。
+
+## 对话原文落盘 / 图片本地化 / 导出 Markdown
+
+换会话续命之后, "事后查得回来"由这三层兜住(全部在 `transcripts/`, 已 gitignore):
+
+1. **JSONL 是唯一真相** (`bridge/transcript.py`): 一条消息一行, **只追加不改写**。
+   同一条消息被站点流式修订多次就写多行, 读的时候按 `(msg_id, 正文哈希)` 去重、
+   以**最后一次**为准; 没有 id 的重复条目让位给带 id 的那条。每行还带
+   `turn / relay_of / source(bridge|site) / bk(正文哈希)` —— 接力链因此能双向查回去
+   (`chain_of`)。四个落盘点: 本轮结束、切到某段会话、点 ⤓ 读回、接力之前。
+2. **图片抓到本地** (`bridge/media.py`): ChatGPT 的 `images.openai.com/...` 是**签名地址,
+   过几天就碎**, 所以同步前先抓下来存 `transcripts/media/<provider>/<会话>/<哈希>.jpg`,
+   正文里改写成相对路径 `media/...`。抓不到就**保留原地址**并在统计里记一笔, 不静默丢图。
+   两个必须知道的限制: 一次同步最多 20 张、总预算 40 秒(站点正文里常混着失效外链,
+   实测一段对话里有 26 个 google favicon 代理链, 单张原本要等满 30s 超时);
+   抓失败的地址在进程里记 10 分钟, 同一段会话反复同步不会反复重等。
+3. **导出 Markdown** (`POST /api/transcript/export`): 会话标题栏那个导出图标(`#convExport`)
+   把这段对话(连着它前后接力出来的窗口)写成 `transcripts/exports/<provider>-<会话id>-<时间>.md`,
+   图片链接改写成 `../media/...`。没有站点会话 id 时按钮置灰并在 title 里说明为什么。
+
+- 界面里回答中的图片:**连续几张并成一行, 一行最多 3 张**(吃掉整行宽度, 不留白);
+  点一张在**本页弹框**看大图(标题栏带 alt 和真实像素数), 不跳走、不开新标签,
+  缩略图一个像素都不挪。
+- 回归: `tests/transcript_store_check.py`、`transcript_export_check.py`、`media_render_check.py`
+  (图片渲染 + 注入面 + 一行 3 张 + 弹框 + 坏链预算)、`switch_lock_check.py`(切会话不会锁住整个桥)。
+- **代价(量过的数)**: 深读一段长对话要一路滚到顶 —— 他侧栏那段 56 条 / 119,483 字的对话
+  实测**深读 199s**、接力预览整条 **214s**。所以点侧栏切会话时后端**只浅读**(读页面上已渲染的
+  几条, 实测 1~4s), 滚到顶的代价只在用户明确点 ⤓ 时才付。
 
 ## 消息列表与站点为什么会对不上(消息不同步)
 
@@ -414,11 +509,24 @@ bridge 的消息列表是**本地记录**(存在浏览器 `localStorage` 的 `wl
      上一轮的前缀, 会被判成"还是那一轮", 25s 后如实报"没捕获到内容"而不是把旧回答当新回答 —— 重发一次即可;
    - 思考过程(若页面渲染)在兜底/dom 模式下会与正文一起被捕获；
    - 单会话串行：`busy` 时新的发送会返回 409；切换 Provider 期间同样 409；
+   - **回答里的表格不渲染**：`renderMarkdown` 只处理标题/列表/引用/行内代码/围栏/整行图片，
+     回答带 markdown 表格时屏幕上就是原样的 `| 列甲 | 列乙 |`；
+   - **切会话只浅读**：点侧栏换一段会话时后端只把"页面上已渲染的那几条"记进 JSONL(实测 1~4s)，
+     整段历史要点 ⤓ 才滚到顶读回来(实测一段 56 条 / 119,483 字的对话深读要 **199s**)；
+   - **图片抓取有上限**：一次同步最多 20 张、总预算 40s，超预算的保留原地址下次再试；
+     失败地址在进程里记 10 分钟(重启后要重等一次)。站点正文里混的失效外链(实测一段对话里有
+     26 个 google favicon 代理链)会吃掉这份预算；
+   - 落盘是**明文**：`transcripts/` 里是对话原文、导出的 Markdown 和抓下来的图片，
+     本机任何进程可读(所以整目录已 gitignore，且服务只监听 127.0.0.1)；
+   - **这台机器的 PATH 里没有任何 C++ 编译器**(`cl` 只在 VS Developer Prompt 里，
+     `gcc/clang/make/nmake` 全无，只有 `cmake`)：Qt/MSVC 那类项目在这里最多验到"语法能编译 /
+     自检脚本能跑"这一层，别指望验证循环能真的构建出可执行文件；
    - 没有任何加密或鉴权——本服务只应监听 127.0.0.1。
 
 ## 下一步建议
 
 - 把事件协议接到你自己的 Scheduler / LLMProvider 抽象；
 - 用 Tauri + Vue 替换内置 HTML 页，做成托盘桌面程序；
-- 增加多 tab 多会话与对话历史(SQLite)；
-- 若需要 ChatGPT 逐字流：登录后在 DevTools 里观察 `backend-api` 请求格式，再把 chatgpt 切到 `stream` 模式。
+- 若需要 ChatGPT 逐字流：登录后在 DevTools 里观察 `backend-api` 请求格式，再把 chatgpt 切到 `stream` 模式；
+- 并行执行(多 tab / 多会话)：目前 `self.page` 被 31 个方法、47 处引用共用，捕获层已经是按页存的，
+  缺的是把"页"这件事从 BrowserManager 里拆出来 —— 这一档他明确说过先不做。

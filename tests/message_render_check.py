@@ -40,7 +40,7 @@ SEED = r"""() => {
   addUserMsg("你好, 帮我看看这段代码");
   current = openAssistantMsg();
   current.reason = "先给出排查顺序。";
-  current.raw = "**结论**: 先确认 DMA 是否真的发生。\n\n```python\nprint('hi')\n```";
+  current.raw = "**结论**: 先确认 `DMA` 是否真的发生。\n\n```python\nprint('hi')\n```";
   renderCurrent();
   current = null;
   handle({ type: "error", text: "示例错误提示" });
@@ -60,6 +60,16 @@ SEED = r"""() => {
     fontBody: getComputedStyle(c.querySelector(".assistant-body")).fontSize,
     fontUser: getComputedStyle(c.querySelector(".user-row .user-bubble")).fontSize,
     fontErr: getComputedStyle(c.querySelector(".errbox")).fontSize,
+    lhBody: getComputedStyle(c.querySelector(".assistant-body")).lineHeight,
+    colorBody: getComputedStyle(c.querySelector(".assistant-body")).color,
+    colorUser: getComputedStyle(c.querySelector(".user-row .user-bubble")).color,
+    bgUser: getComputedStyle(c.querySelector(".user-row .user-bubble")).backgroundColor,
+    codeSize: (e => e ? getComputedStyle(e).fontSize : null)
+              (c.querySelector(".assistant-body :not(pre) > code")),
+    codeColor: (e => e ? getComputedStyle(e).color : null)
+               (c.querySelector(".assistant-body :not(pre) > code")),
+    codeBg: (e => e ? getComputedStyle(e).backgroundColor : null)
+            (c.querySelector(".assistant-body :not(pre) > code")),
   };
   // 流式中的光标: 必须紧贴最后一段文字右侧, 不能另起一行
   current = openAssistantMsg();
@@ -70,11 +80,16 @@ SEED = r"""() => {
   const host = cur ? cur.parentElement : null;
   const cr = cur ? cur.getBoundingClientRect() : null;
   const hr = host ? host.getBoundingClientRect() : null;
+  // 判"在同一行"用第一行的行盒, 不用"离容器顶 <6px"那种魔法数: 正文从 14px 放大到
+  // 16px/26px 之后, 光标(15px 高)天然要往下偏几像素, 那个 6 就把它误判成"另起一行"了。
+  const lh = host ? parseFloat(getComputedStyle(host).lineHeight) : 0;
   const cursorInfo = {
     exists: !!cur,
     parentTag: host ? host.tagName.toLowerCase() : null,
     parentIsBody: host ? host.classList.contains("assistant-body") : null,
-    sameLine: !!(cr && hr && Math.abs(cr.top - hr.top) < 6),
+    lineBox: (cr && hr) ? {top: Math.round(cr.top - hr.top), bottom: Math.round(cr.bottom - hr.top),
+                           lh: Math.round(lh)} : null,
+    sameLine: !!(cr && hr && lh && cr.top >= hr.top - 1 && cr.bottom <= hr.top + lh + 1),
     snugRight: !!(cr && hr && cr.left > hr.left && cr.left <= hr.right + 4),
   };
   current.busy = false;
@@ -143,9 +158,25 @@ async def main() -> int:
         bad.append("错误提示未渲染: " + str(r["errText"]))
     if not r["markdownHtml"]:
         bad.append("markdown 代码块未渲染")
-    for key, name in (("fontBody", "助手正文"), ("fontUser", "用户气泡"), ("fontErr", "错误提示")):
-        if r[key] != "14px":
-            bad.append(f"{name}字号应为 14px: {r[key]}")
+    # 字号/行高/字色钉的是 2026-09-26 从你 ChatGPT 页面量回来的那套 computed 值:
+    #   正文/用户气泡/错误行 都是 16px / 行高 26px; 助手字色 rgb(13,13,13);
+    #   用户气泡字色 rgb(12,39,74) 底 rgb(232,243,254); 行内代码 14px 且不再是粉色。
+    # 全站字号只许落在 ChatGPT 那几档这件事由 tests/type_scale_check.py 扫 DOM 来管。
+    for key, want, name in (("fontBody", "16px", "助手正文"), ("fontUser", "16px", "用户气泡"),
+                            ("fontErr", "16px", "错误提示"), ("lhBody", "26px", "助手正文行高"),
+                            ("codeSize", "14px", "行内代码字号")):
+        if r[key] != want:
+            bad.append(f"{name}应为 {want}: {r[key]}")
+    for key, want, name in (("colorBody", "rgb(13, 13, 13)", "助手字色"),
+                            ("colorUser", "rgb(12, 39, 74)", "用户气泡字色"),
+                            ("bgUser", "rgb(232, 243, 254)", "用户气泡底色"),
+                            ("codeColor", "rgb(13, 13, 13)", "行内代码字色"),
+                            ("codeBg", "rgb(236, 236, 236)", "行内代码底色")):
+        if r[key] != want:
+            bad.append(f"{name}应为 {want}: {r[key]}")
+    print("   字体钉值: %s" % json.dumps({k: r[k] for k in (
+        "fontBody", "fontUser", "fontErr", "lhBody", "colorBody", "colorUser", "bgUser",
+        "codeSize", "codeColor", "codeBg")}, ensure_ascii=False))
     # 滚动条必须在最外层(主区右边缘), 而不是内容列里
     if not r["wrapScrolls"]:
         bad.append("内容超出一屏时外层容器没有滚动")

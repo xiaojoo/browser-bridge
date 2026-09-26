@@ -90,7 +90,7 @@ async def main() -> int:
 
         planner.ask = fake_ask
         try:
-            r = await server.api_world_verify(server.WorldVerifyRequest(
+            r = await server._verify_core(server.WorldVerifyRequest(
                 task=TASK, answer="可以, 按你这个 EditorArea.qml, 需要改 3 个点…", applied=[],
                 max_rounds=3, timeout=120))
         finally:
@@ -145,7 +145,7 @@ async def main() -> int:
 
         planner.ask = fake_ask2
         try:
-            r2 = await server.api_world_verify(server.WorldVerifyRequest(
+            r2 = await server._verify_core(server.WorldVerifyRequest(
                 task=TASK, answer="需要改 3 个点…", applied=[], max_rounds=3, timeout=60))
         finally:
             planner.ask = orig_ask
