@@ -84,9 +84,14 @@ python main.py
 
 ```bash
 for t in tests/*_check.py tests/*_test.py; do
+  case "$t" in *live_engineer_check.py|*full_path_test.py) continue;; esac   # 这两条会真发一轮
   PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe "$t" >/dev/null 2>&1 || echo "FAIL $t"
 done
 ```
+
+上面这条已经排掉了 `live_engineer_check` / `full_path_test` —— 它们的名字也匹配 `*_check.py` /
+`*_test.py`，不排就会被顺手跑掉。这两条都是真发：`full_path_test` 往 `/api/chat` 发一句
+「请只回复:OK」，`live_engineer_check` 走 `/api/engineer/run` 让模型**在你的工作区里新建文件**并校验落盘。
 
 - **必须用 `.venv` 里那个 python**(只有它装了 playwright)，系统 python 会 `ModuleNotFoundError`；
 - **必须带 `PYTHONIOENCODING=utf-8`**，否则门禁 `print` 中文/图标会 `UnicodeEncodeError`，
